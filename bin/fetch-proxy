@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env sh
 
 # If the first argument to this script is "latest" or unset, it fetches the
 # latest proxy binary from the linkerd2-proxy github releases. If it's set to
@@ -17,7 +17,8 @@ if [ "$version" = latest ]; then
 fi
 
 assetbase="https://github.com/linkerd/linkerd2-proxy/releases/download/release%2F${version}"
-pkgname="linkerd2-proxy-${version}"
+arch=${2:-amd64}
+pkgname="linkerd2-proxy-${version}-${arch}"
 pkgfile="${pkgname}.tar.gz"
 shafile="${pkgname}.txt"
 
@@ -28,7 +29,11 @@ curl -sLO "$assetbase/$shafile"
 
 tar -zxvf "$pkgfile" >&2
 expected=$(awk '{print $1}' "$shafile")
-computed=$(sha256sum "$pkgfile" | awk '{print $1}')
+if [ "$(uname)" = "Darwin" ]; then
+  computed=$(openssl dgst -sha256 "$pkgfile" | awk '{print $2}')
+else
+  computed=$(sha256sum "$pkgfile" | awk '{print $1}')
+fi
 if [ "$computed" != "$expected" ]; then
   echo 'sha mismatch' >&2
   exit 1

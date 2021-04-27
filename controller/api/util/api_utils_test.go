@@ -2,16 +2,15 @@ package util
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/k8s"
+	pb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	corev1 "k8s.io/api/core/v1"
 	k8sError "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -39,163 +38,17 @@ func TestGRPCError(t *testing.T) {
 	})
 }
 
-func TestBuildStatSummaryRequest(t *testing.T) {
-	t.Run("Maps Kubernetes friendly names to canonical names", func(t *testing.T) {
-		expectations := map[string]string{
-			"deployments": k8s.Deployment,
-			"deployment":  k8s.Deployment,
-			"deploy":      k8s.Deployment,
-			"pods":        k8s.Pod,
-			"pod":         k8s.Pod,
-			"po":          k8s.Pod,
-		}
-
-		for friendly, canonical := range expectations {
-			statSummaryRequest, err := BuildStatSummaryRequest(
-				StatsSummaryRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						ResourceType: friendly,
-					},
-				},
-			)
-			if err != nil {
-				t.Fatalf("Unexpected error from BuildStatSummaryRequest [%s => %s]: %s", friendly, canonical, err)
-			}
-			if statSummaryRequest.Selector.Resource.Type != canonical {
-				t.Fatalf("Unexpected resource type from BuildStatSummaryRequest [%s => %s]: %s", friendly, canonical, statSummaryRequest.Selector.Resource.Type)
-			}
-		}
-	})
-
-	t.Run("Parses valid time windows", func(t *testing.T) {
-		expectations := []string{
-			"1m",
-			"60s",
-			"1m",
-		}
-
-		for _, timeWindow := range expectations {
-			statSummaryRequest, err := BuildStatSummaryRequest(
-				StatsSummaryRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						TimeWindow:   timeWindow,
-						ResourceType: k8s.Deployment,
-					},
-				},
-			)
-			if err != nil {
-				t.Fatalf("Unexpected error from BuildStatSummaryRequest [%s => %s]", timeWindow, err)
-			}
-			if statSummaryRequest.TimeWindow != timeWindow {
-				t.Fatalf("Unexpected TimeWindow from BuildStatSummaryRequest [%s => %s]", timeWindow, statSummaryRequest.TimeWindow)
-			}
-		}
-	})
-
-	t.Run("Rejects invalid time windows", func(t *testing.T) {
-		expectations := map[string]string{
-			"1": "time: missing unit in duration 1",
-			"s": "time: invalid duration s",
-		}
-
-		for timeWindow, msg := range expectations {
-			_, err := BuildStatSummaryRequest(
-				StatsSummaryRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						TimeWindow: timeWindow,
-					},
-				},
-			)
-			if err == nil {
-				t.Fatalf("BuildStatSummaryRequest(%s) unexpectedly succeeded, should have returned %s", timeWindow, msg)
-			}
-			if err.Error() != msg {
-				t.Fatalf("BuildStatSummaryRequest(%s) should have returned: %s but got unexpected message: %s", timeWindow, msg, err)
-			}
-		}
-	})
-
-	t.Run("Rejects invalid Kubernetes resource types", func(t *testing.T) {
-		expectations := map[string]string{
-			"foo": "cannot find Kubernetes canonical name from friendly name [foo]",
-			"":    "cannot find Kubernetes canonical name from friendly name []",
-		}
-
-		for input, msg := range expectations {
-			_, err := BuildStatSummaryRequest(
-				StatsSummaryRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						ResourceType: input,
-					},
-				},
-			)
-			if err == nil {
-				t.Fatalf("BuildStatSummaryRequest(%s) unexpectedly succeeded, should have returned %s", input, msg)
-			}
-			if err.Error() != msg {
-				t.Fatalf("BuildStatSummaryRequest(%s) should have returned: %s but got unexpected message: %s", input, msg, err)
-			}
-		}
-	})
+type resourceExp struct {
+	namespace string
+	args      []string
+	resource  *pb.Resource
 }
 
-func TestBuildTopRoutesRequest(t *testing.T) {
-	t.Run("Parses valid time windows", func(t *testing.T) {
-		expectations := []string{
-			"1m",
-			"60s",
-			"1m",
-		}
-
-		for _, timeWindow := range expectations {
-			topRoutesRequest, err := BuildTopRoutesRequest(
-				TopRoutesRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						TimeWindow:   timeWindow,
-						ResourceType: k8s.Deployment,
-					},
-				},
-			)
-			if err != nil {
-				t.Fatalf("Unexpected error from BuildTopRoutesRequest [%s => %s]", timeWindow, err)
-			}
-			if topRoutesRequest.TimeWindow != timeWindow {
-				t.Fatalf("Unexpected TimeWindow from BuildTopRoutesRequest [%s => %s]", timeWindow, topRoutesRequest.TimeWindow)
-			}
-		}
-	})
-
-	t.Run("Rejects invalid time windows", func(t *testing.T) {
-		expectations := map[string]string{
-			"1": "time: missing unit in duration 1",
-			"s": "time: invalid duration s",
-		}
-
-		for timeWindow, msg := range expectations {
-			_, err := BuildTopRoutesRequest(
-				TopRoutesRequestParams{
-					StatsBaseRequestParams: StatsBaseRequestParams{
-						TimeWindow:   timeWindow,
-						ResourceType: k8s.Deployment,
-					},
-				},
-			)
-			if err == nil {
-				t.Fatalf("BuildTopRoutesRequest(%s) unexpectedly succeeded, should have returned %s", timeWindow, msg)
-			}
-			if err.Error() != msg {
-				t.Fatalf("BuildTopRoutesRequest(%s) should have returned: %s but got unexpected message: %s", timeWindow, msg, err)
-			}
-		}
-	})
+func (r *resourceExp) String() string {
+	return fmt.Sprintf("namespace: %s, args: %s, resource: %s", r.namespace, r.args, r.resource.String())
 }
 
 func TestBuildResource(t *testing.T) {
-	type resourceExp struct {
-		namespace string
-		args      []string
-		resource  pb.Resource
-	}
 
 	t.Run("Returns expected errors on invalid input", func(t *testing.T) {
 		msg := "cannot find Kubernetes canonical name from friendly name [invalid]"
@@ -222,7 +75,7 @@ func TestBuildResource(t *testing.T) {
 			{
 				namespace: "test-ns",
 				args:      []string{"deployments"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "test-ns",
 					Type:      k8s.Deployment,
 					Name:      "",
@@ -231,7 +84,7 @@ func TestBuildResource(t *testing.T) {
 			{
 				namespace: "",
 				args:      []string{"deploy/foo"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Deployment,
 					Name:      "foo",
@@ -240,7 +93,7 @@ func TestBuildResource(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"po"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "foo-ns",
 					Type:      k8s.Pod,
 					Name:      "",
@@ -249,7 +102,7 @@ func TestBuildResource(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"ns"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Namespace,
 					Name:      "",
@@ -258,7 +111,7 @@ func TestBuildResource(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"ns/foo-ns2"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Namespace,
 					Name:      "foo-ns2",
@@ -269,7 +122,7 @@ func TestBuildResource(t *testing.T) {
 		for _, exp := range expectations {
 			res, err := BuildResource(exp.namespace, exp.args[0])
 			if err != nil {
-				t.Fatalf("Unexpected error from BuildResource(%+v) => %s", exp, err)
+				t.Fatalf("Unexpected error from BuildResource(%s) => %s", exp.String(), err)
 			}
 
 			if !reflect.DeepEqual(exp.resource, res) {
@@ -280,12 +133,6 @@ func TestBuildResource(t *testing.T) {
 }
 
 func TestBuildResources(t *testing.T) {
-	type resourceExp struct {
-		namespace string
-		args      []string
-		resource  pb.Resource
-	}
-
 	t.Run("Rejects duped resources", func(t *testing.T) {
 		msg := "cannot supply duplicate resources"
 		expectations := []resourceExp{
@@ -343,7 +190,7 @@ func TestBuildResources(t *testing.T) {
 			{
 				namespace: "test-ns",
 				args:      []string{"deployments"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "test-ns",
 					Type:      k8s.Deployment,
 					Name:      "",
@@ -352,7 +199,7 @@ func TestBuildResources(t *testing.T) {
 			{
 				namespace: "",
 				args:      []string{"deploy/foo"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Deployment,
 					Name:      "foo",
@@ -361,7 +208,7 @@ func TestBuildResources(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"po", "foo"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "foo-ns",
 					Type:      k8s.Pod,
 					Name:      "foo",
@@ -370,7 +217,7 @@ func TestBuildResources(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"ns", "foo-ns2"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Namespace,
 					Name:      "foo-ns2",
@@ -379,7 +226,7 @@ func TestBuildResources(t *testing.T) {
 			{
 				namespace: "foo-ns",
 				args:      []string{"ns/foo-ns2"},
-				resource: pb.Resource{
+				resource: &pb.Resource{
 					Namespace: "",
 					Type:      k8s.Namespace,
 					Name:      "foo-ns2",
@@ -395,77 +242,6 @@ func TestBuildResources(t *testing.T) {
 
 			if !reflect.DeepEqual(exp.resource, res[0]) {
 				t.Fatalf("Expected resource to be [%+v] but was [%+v]", exp.resource, res[0])
-			}
-		}
-	})
-}
-
-func TestK8sPodToPublicPod(t *testing.T) {
-	type podExp struct {
-		k8sPod    corev1.Pod
-		ownerKind string
-		ownerName string
-		publicPod pb.Pod
-	}
-
-	t.Run("Returns expected pods", func(t *testing.T) {
-		expectations := []podExp{
-			{
-				k8sPod: corev1.Pod{},
-				publicPod: pb.Pod{
-					Name: "/",
-				},
-			},
-			{
-				k8sPod: corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace:       "ns",
-						Name:            "name",
-						ResourceVersion: "resource-version",
-						Labels: map[string]string{
-							k8s.ControllerComponentLabel: "controller-component",
-							k8s.ControllerNSLabel:        "controller-ns",
-						},
-					},
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  k8s.ProxyContainerName,
-								Image: "linkerd-proxy:test-version",
-							},
-						},
-					},
-					Status: corev1.PodStatus{
-						PodIP: "pod-ip",
-						Phase: "status",
-						ContainerStatuses: []corev1.ContainerStatus{
-							{
-								Name:  k8s.ProxyContainerName,
-								Ready: true,
-							},
-						},
-					},
-				},
-				ownerKind: k8s.Deployment,
-				ownerName: "owner-name",
-				publicPod: pb.Pod{
-					Name:                "ns/name",
-					Owner:               &pb.Pod_Deployment{Deployment: "ns/owner-name"},
-					ResourceVersion:     "resource-version",
-					ControlPlane:        true,
-					ControllerNamespace: "controller-ns",
-					Status:              "status",
-					ProxyReady:          true,
-					ProxyVersion:        "test-version",
-					PodIP:               "pod-ip",
-				},
-			},
-		}
-
-		for _, exp := range expectations {
-			res := K8sPodToPublicPod(exp.k8sPod, exp.ownerKind, exp.ownerName)
-			if !reflect.DeepEqual(exp.publicPod, res) {
-				t.Fatalf("Expected pod to be [%+v] but was [%+v]", exp.publicPod, res)
 			}
 		}
 	})

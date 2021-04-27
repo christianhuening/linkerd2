@@ -96,10 +96,10 @@ const getTcpStats = row => {
     return {};
   } else {
     const seconds = timeWindowSeconds(row.timeWindow);
-    const readBytes = parseInt(row.tcpStats.readBytesTotal, 0);
-    const writeBytes = parseInt(row.tcpStats.writeBytesTotal, 0);
+    const readBytes = parseInt(row.tcpStats.readBytesTotal, 10);
+    const writeBytes = parseInt(row.tcpStats.writeBytesTotal, 10);
     return {
-      openConnections: parseInt(row.tcpStats.openConnections, 0),
+      openConnections: parseInt(row.tcpStats.openConnections, 10),
       readBytes,
       writeBytes,
       readRate: seconds === 0 ? null : readBytes / seconds,
@@ -154,6 +154,31 @@ export const processTopRoutesResults = rows => {
   ));
 };
 
+const processGatewayTable = table => {
+  const rows = _compact(table.rows.map(row => {
+    const rowKey = `${row.namespace}-gateway-${row.name}`;
+    return {
+      key: rowKey,
+      name: row.name,
+      namespace: row.namespace,
+      clusterName: row.clusterName,
+      alive: row.alive,
+      pairedServices: row.pairedServices,
+      latency: {
+        P50: parseInt(row.latencyMsP50, 10),
+        P95: parseInt(row.latencyMsP95, 10),
+        P99: parseInt(row.latencyMsP99, 10),
+      },
+    };
+  }));
+  return _orderBy(rows, r => r.name);
+};
+export const processGatewayResults = rawMetrics => {
+  if (_isEmpty(rawMetrics.ok) || _isEmpty(rawMetrics.ok.gatewaysTable)) {
+    return {};
+  }
+  return processGatewayTable(rawMetrics.ok.gatewaysTable);
+};
 export const processMultiResourceRollup = (rawMetrics, resourceType) => {
   if (_isEmpty(rawMetrics.ok) || _isEmpty(rawMetrics.ok.statTables)) {
     return {};

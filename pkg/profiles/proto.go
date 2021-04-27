@@ -45,11 +45,18 @@ func protoToServiceProfile(parser *proto.Parser, namespace, name, clusterDomain 
 			pkg = typed.Name
 		case *proto.RPC:
 			if service, ok := typed.Parent.(*proto.Service); ok {
+				var path string
+				switch pkg {
+				case "":
+					path = fmt.Sprintf("/%s/%s", service.Name, typed.Name)
+				default:
+					path = fmt.Sprintf("/%s.%s/%s", pkg, service.Name, typed.Name)
+				}
 				route := &sp.RouteSpec{
 					Name: typed.Name,
 					Condition: &sp.RequestMatch{
 						Method:    http.MethodPost,
-						PathRegex: regexp.QuoteMeta(fmt.Sprintf("/%s.%s/%s", pkg, service.Name, typed.Name)),
+						PathRegex: regexp.QuoteMeta(path),
 					},
 				}
 				routes = append(routes, route)
@@ -64,7 +71,7 @@ func protoToServiceProfile(parser *proto.Parser, namespace, name, clusterDomain 
 			Name:      fmt.Sprintf("%s.%s.svc.%s", name, namespace, clusterDomain),
 			Namespace: namespace,
 		},
-		TypeMeta: serviceProfileMeta,
+		TypeMeta: ServiceProfileMeta,
 		Spec: sp.ServiceProfileSpec{
 			Routes: routes,
 		},

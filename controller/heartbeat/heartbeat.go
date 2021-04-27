@@ -10,19 +10,26 @@ import (
 	"strconv"
 	"time"
 
+	pkgK8s "github.com/linkerd/linkerd2/controller/k8s"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/version"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type containerMeta struct {
+	name model.LabelValue
+	ns   model.LabelValue
+}
+
 // K8sValues gathers relevant heartbeat information from Kubernetes
-func K8sValues(kubeAPI *k8s.KubernetesAPI, controlPlaneNamespace string) url.Values {
+func K8sValues(ctx context.Context, kubeAPI *k8s.KubernetesAPI, controlPlaneNamespace string) url.Values {
 	v := url.Values{}
 
-	cm, _, err := healthcheck.FetchLinkerdConfigMap(kubeAPI, controlPlaneNamespace)
+	cm, _, err := healthcheck.FetchLinkerdConfigMap(ctx, kubeAPI, controlPlaneNamespace)
 	if err != nil {
 		log.Errorf("Failed to fetch linkerd-config: %s", err)
 	} else {
@@ -36,6 +43,36 @@ func K8sValues(kubeAPI *k8s.KubernetesAPI, controlPlaneNamespace string) url.Val
 	} else {
 		v.Set("k8s-version", versionInfo.String())
 	}
+
+	namespaces, err := kubeAPI.GetAllNamespacesWithExtensionLabel(ctx)
+	if err != nil {
+		log.Errorf("Failed to fetch namespaces with %s label: %s", k8s.LinkerdExtensionLabel, err)
+	} else {
+		for _, ns := range namespaces {
+			extensionNameParam := fmt.Sprintf("ext-%s", ns.Labels[k8s.LinkerdExtensionLabel])
+			v.Set(extensionNameParam, "1")
+		}
+	}
+
+	err = k8s.ServiceProfilesAccess(ctx, kubeAPI)
+	if err != nil {
+		log.Errorf("Failed to verify service profile access: %s", err)
+		return v
+	}
+
+	spClient, err := pkgK8s.NewSpClientSet(kubeAPI.Config)
+	if err != nil {
+		log.Errorf("Failed to create service profile client: %s", err)
+		return v
+	}
+
+	spList, err := spClient.LinkerdV1alpha2().ServiceProfiles("").List(ctx, v1.ListOptions{})
+	if err != nil {
+		log.Errorf("Failed to get service profiles: %s", err)
+		return v
+	}
+
+	v.Set("service-profile-count", strconv.Itoa(len(spList.Items)))
 
 	return v
 }
@@ -87,10 +124,7 @@ func PromValues(promAPI promv1.API, controlPlaneNamespace string) url.Values {
 	}
 
 	// container metrics
-	for _, container := range []struct {
-		name model.LabelValue
-		ns   model.LabelValue
-	}{
+	for _, container := range []containerMeta{
 		{
 			name: "linkerd-proxy",
 		},
@@ -103,16 +137,13 @@ func PromValues(promAPI promv1.API, controlPlaneNamespace string) url.Values {
 			ns:   "linkerd",
 		},
 	} {
-		containerLabels := model.LabelSet{
-			"job":            "kubernetes-nodes-cadvisor",
-			"container_name": container.name,
-		}
-		if container.ns != "" {
-			containerLabels["namespace"] = container.ns
-		}
+		// as of k8s 1.16 cadvisor labels container names with just `container`
+		containerLabelsPre16 := getLabelSet(container, "container_name")
+		containerLabelsPost16 := getLabelSet(container, "container")
 
 		// max-mem
-		query = fmt.Sprintf("max(container_memory_working_set_bytes%s)", containerLabels)
+		query = fmt.Sprintf("max(container_memory_working_set_bytes%s or container_memory_working_set_bytes%s)",
+			containerLabelsPre16, containerLabelsPost16)
 		value, err = promQuery(promAPI, query, 0)
 		if err != nil {
 			log.Errorf("Prometheus query failed: %s", err)
@@ -122,7 +153,9 @@ func PromValues(promAPI promv1.API, controlPlaneNamespace string) url.Values {
 		}
 
 		// p95-cpu
-		query = fmt.Sprintf("max(quantile_over_time(0.95,rate(container_cpu_usage_seconds_total%s[5m])[24h:5m]))", containerLabels)
+		query = fmt.Sprintf("max(quantile_over_time(0.95,rate(container_cpu_usage_seconds_total%s[5m])[24h:5m]) "+
+			"or quantile_over_time(0.95,rate(container_cpu_usage_seconds_total%s[5m])[24h:5m]))",
+			containerLabelsPre16, containerLabelsPost16)
 		value, err = promQuery(promAPI, query, 3)
 		if err != nil {
 			log.Errorf("Prometheus query failed: %s", err)
@@ -133,6 +166,17 @@ func PromValues(promAPI promv1.API, controlPlaneNamespace string) url.Values {
 	}
 
 	return v
+}
+
+func getLabelSet(container containerMeta, containerKey model.LabelName) model.LabelSet {
+	containerLabels := model.LabelSet{
+		"job":        "kubernetes-nodes-cadvisor",
+		containerKey: container.name,
+	}
+	if container.ns != "" {
+		containerLabels["namespace"] = container.ns
+	}
+	return containerLabels
 }
 
 func promQuery(promAPI promv1.API, query string, precision int) (string, error) {
@@ -195,6 +239,9 @@ func send(client *http.Client, baseURL string, v url.Values) error {
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %s", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("request failed with code %d; response body: %s", resp.StatusCode, string(body))
 	}
 
 	log.Infof("Successfully sent heartbeat: %s", string(body))

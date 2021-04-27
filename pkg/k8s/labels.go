@@ -7,7 +7,6 @@ package k8s
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/linkerd/linkerd2/pkg/version"
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,9 +25,25 @@ const (
 	// that contain a Linkerd control plane
 	LinkerdNamespaceLabel = Prefix + "/is-control-plane"
 
+	// LinkerdExtensionLabel is a label that helps identifying the namespace
+	// that contain a Linkerd Extension
+	LinkerdExtensionLabel = Prefix + "/extension"
+
 	// ControllerComponentLabel identifies this object as a component of Linkerd's
 	// control plane (e.g. web, controller).
 	ControllerComponentLabel = Prefix + "/control-plane-component"
+
+	// ExtensionAPIServerAuthenticationConfigMapName is the name of the ConfigMap where
+	// authentication data for extension API servers is placed.
+	ExtensionAPIServerAuthenticationConfigMapName = "extension-apiserver-authentication"
+
+	// ExtensionAPIServerAuthenticationRequestHeaderClientCAFileKey is the key that
+	// contains the value of the "--requestheader-client-ca-file" flag.
+	ExtensionAPIServerAuthenticationRequestHeaderClientCAFileKey = "requestheader-client-ca-file"
+
+	// RequireIDHeader signals to the proxy that a certain identity should be expected
+	// of the remote peer
+	RequireIDHeader = "l5d-require-id"
 
 	// ControllerNSLabel is injected into mesh-enabled apps, identifying the
 	// namespace of the Linkerd control plane.
@@ -62,6 +77,16 @@ const (
 	// CronJob that this proxy belongs to.
 	ProxyCronJobLabel = Prefix + "/proxy-cronjob"
 
+	// WorkloadNamespaceLabel is injected into mesh-enabled apps, identifying the
+	// Namespace that this proxy belongs to.
+	WorkloadNamespaceLabel = Prefix + "/workload-ns"
+
+	// Enabled is used by annotations whose valid values include "enabled".
+	Enabled = "enabled"
+
+	// Disabled is used by annotations whose valid values incluce "disabled".
+	Disabled = "disabled"
+
 	/*
 	 * Annotations
 	 */
@@ -80,16 +105,20 @@ const (
 
 	// ProxyInjectAnnotation controls whether or not a pod should be injected
 	// when set on a pod spec. When set on a namespace spec, it applies to all
-	// pods in the namespace. Supported values are "enabled" or "disabled"
+	// pods in the namespace. Supported values are Enabled or Disabled
 	ProxyInjectAnnotation = Prefix + "/inject"
 
 	// ProxyInjectEnabled is assigned to the ProxyInjectAnnotation annotation to
 	// enable injection for a pod or namespace.
-	ProxyInjectEnabled = "enabled"
+	ProxyInjectEnabled = Enabled
+
+	// ProxyInjectIngress is assigned to the ProxyInjectAnnotation annotation to
+	// enable injection in ingress mode for a pod.
+	ProxyInjectIngress = "ingress"
 
 	// ProxyInjectDisabled is assigned to the ProxyInjectAnnotation annotation to
 	// disable injection for a pod or namespace.
-	ProxyInjectDisabled = "disabled"
+	ProxyInjectDisabled = Disabled
 
 	// IdentityModeAnnotation controls how a pod participates
 	// in service identity.
@@ -116,7 +145,7 @@ const (
 	// config.
 	ProxyInitImageAnnotation = ProxyConfigAnnotationsPrefix + "/init-image"
 
-	// ProxyInitImageVersionAnnotation can be used to overrided the proxy-init image version
+	// ProxyInitImageVersionAnnotation can be used to override the proxy-init image version
 	ProxyInitImageVersionAnnotation = ProxyConfigAnnotationsPrefix + "/init-image-version"
 
 	// DebugImageAnnotation can be used to override the debugImage config.
@@ -134,6 +163,10 @@ const (
 	// ProxyIgnoreInboundPortsAnnotation can be used to override the
 	// ignoreInboundPorts config.
 	ProxyIgnoreInboundPortsAnnotation = ProxyConfigAnnotationsPrefix + "/skip-inbound-ports"
+
+	// ProxyOpaquePortsAnnotation can be used to override the opaquePorts
+	// config.
+	ProxyOpaquePortsAnnotation = ProxyConfigAnnotationsPrefix + "/opaque-ports"
 
 	// ProxyIgnoreOutboundPortsAnnotation can be used to override the
 	// ignoreOutboundPorts config.
@@ -168,6 +201,9 @@ const (
 	// ProxyLogLevelAnnotation can be used to override the log level config.
 	ProxyLogLevelAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-log-level"
 
+	// ProxyLogFormatAnnotation can be used to override the log format config.
+	ProxyLogFormatAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-log-format"
+
 	// ProxyEnableExternalProfilesAnnotation can be used to override the
 	// disableExternalProfilesAnnotation config.
 	ProxyEnableExternalProfilesAnnotation = ProxyConfigAnnotationsPrefix + "/enable-external-profiles"
@@ -175,30 +211,40 @@ const (
 	// ProxyVersionOverrideAnnotation can be used to override the proxy version config.
 	ProxyVersionOverrideAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-version"
 
+	// ProxyRequireIdentityOnInboundPortsAnnotation can be used to configure the proxy
+	// to always require identity on inbound ports
+	ProxyRequireIdentityOnInboundPortsAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-require-identity-inbound-ports"
+
+	// ProxyOutboundConnectTimeout can be used to configure the outbound TCP connection
+	// timeout in the proxy
+	ProxyOutboundConnectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-outbound-connect-timeout"
+
+	// ProxyInboundConnectTimeout can be used to configure the inbound TCP connection
+	// timeout in the proxy
+	ProxyInboundConnectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-inbound-connect-timeout"
+
+	// ProxyEnableGatewayAnnotation can be used to configure the proxy
+	// to operate as a gateway, routing requests that target the inbound router.
+	ProxyEnableGatewayAnnotation = ProxyConfigAnnotationsPrefix + "/enable-gateway"
+
 	// ProxyDisableIdentityAnnotation can be used to disable identity on the injected proxy.
 	ProxyDisableIdentityAnnotation = ProxyConfigAnnotationsPrefix + "/disable-identity"
-
-	// ProxyDisableTapAnnotation can be used to disable tap on the injected proxy.
-	ProxyDisableTapAnnotation = ProxyConfigAnnotationsPrefix + "/disable-tap"
 
 	// ProxyEnableDebugAnnotation is set to true if the debug container is
 	// injected.
 	ProxyEnableDebugAnnotation = ProxyConfigAnnotationsPrefix + "/enable-debug-sidecar"
 
-	// ProxyTraceCollectorSvcAddrAnnotation can be used to enable tracing on a proxy.
-	// It takes the collector service name (e.g. oc-collector.tracing:55678) as
-	// its value.
-	ProxyTraceCollectorSvcAddrAnnotation = ProxyConfigAnnotationsPrefix + "/trace-collector"
+	// CloseWaitTimeoutAnnotation configures nf_conntrack_tcp_timeout_close_wait.
+	CloseWaitTimeoutAnnotation = ProxyConfigAnnotationsPrefix + "/close-wait-timeout"
 
 	// ProxyWaitBeforeExitSecondsAnnotation makes the proxy container to wait for the given period before exiting
 	// after the Pod entered the Terminating state. Must be smaller than terminationGracePeriodSeconds
 	// configured for the Pod
 	ProxyWaitBeforeExitSecondsAnnotation = ProxyConfigAnnotationsPrefixAlpha + "/proxy-wait-before-exit-seconds"
 
-	// ProxyTraceCollectorSvcAccountAnnotation is used to specify the service account
-	// associated with the trace collector. It is used to create the service's
-	// mTLS identity.
-	ProxyTraceCollectorSvcAccountAnnotation = ProxyConfigAnnotationsPrefixAlpha + "/trace-collector-service-account"
+	// ProxyAwait can be used to force the application to wait for the proxy
+	// to be ready.
+	ProxyAwait = ProxyConfigAnnotationsPrefix + "/proxy-await"
 
 	// IdentityModeDefault is assigned to IdentityModeAnnotation to
 	// use the control plane's default identity scheme.
@@ -206,7 +252,7 @@ const (
 
 	// IdentityModeDisabled is assigned to IdentityModeAnnotation to
 	// disable the proxy from participating in automatic identity.
-	IdentityModeDisabled = "disabled"
+	IdentityModeDisabled = Disabled
 
 	/*
 	 * Component Names
@@ -215,14 +261,21 @@ const (
 	// ConfigConfigMapName is the name of the ConfigMap containing the linkerd controller configuration.
 	ConfigConfigMapName = "linkerd-config"
 
+	// AddOnsConfigMapName is the name of the ConfigMap containing the linkerd add-ons configuration.
+	AddOnsConfigMapName = "linkerd-config-addons"
+
 	// DebugSidecarName is the name of the default linkerd debug container
 	DebugSidecarName = "linkerd-debug"
 
 	// DebugSidecarImage is the image name of the default linkerd debug container
-	DebugSidecarImage = "gcr.io/linkerd-io/debug"
+	DebugSidecarImage = "cr.l5d.io/linkerd/debug"
 
 	// InitContainerName is the name assigned to the injected init container.
 	InitContainerName = "linkerd-init"
+
+	// InitXtablesLockVolumeMountName is the name of the volumeMount used by proxy-init
+	// to handle iptables-legacy
+	InitXtablesLockVolumeMountName = "linkerd-proxy-init-xtables-lock"
 
 	// ProxyContainerName is the name assigned to the injected proxy container.
 	ProxyContainerName = "linkerd-proxy"
@@ -267,6 +320,9 @@ const (
 	// TapServiceName is the name of the tap APIService
 	TapServiceName = "linkerd-tap"
 
+	// TapAPIRegistrationServiceName is the name of the tap APIService registration resource
+	TapAPIRegistrationServiceName = "v1alpha1.tap.linkerd.io"
+
 	// AdmissionWebhookLabel indicates whether admission webhooks are enabled for a namespace
 	AdmissionWebhookLabel = ProxyConfigAnnotationsPrefix + "/admission-webhooks"
 
@@ -277,7 +333,7 @@ const (
 	// MountPathBase is the base directory of the mount path.
 	MountPathBase = "/var/run/linkerd"
 
-	// MountPathServiceAccount is the default path where Kuberenetes stores
+	// MountPathServiceAccount is the default path where Kubernetes stores
 	// the service account token
 	MountPathServiceAccount = "/var/run/secrets/kubernetes.io/serviceaccount"
 
@@ -290,21 +346,96 @@ const (
 	// MountPathInstallConfig is the path at which the install config file is mounted.
 	MountPathInstallConfig = MountPathBase + "/config/install"
 
+	// MountPathValuesConfig is the path at which the values config file is mounted.
+	MountPathValuesConfig = MountPathBase + "/config/values"
+
 	// MountPathEndEntity is the path at which a tmpfs directory is mounted to
 	// store identity credentials.
 	MountPathEndEntity = MountPathBase + "/identity/end-entity"
 
+	// MountPathTLSBase is the path at which the TLS cert and key PEM files are mounted
+	MountPathTLSBase = MountPathBase + "/tls"
+
 	// MountPathTLSKeyPEM is the path at which the TLS key PEM file is mounted.
-	MountPathTLSKeyPEM = MountPathBase + "/tls/key.pem"
+	MountPathTLSKeyPEM = MountPathTLSBase + "/tls.key"
 
 	// MountPathTLSCrtPEM is the path at which the TLS cert PEM file is mounted.
-	MountPathTLSCrtPEM = MountPathBase + "/tls/crt.pem"
+	MountPathTLSCrtPEM = MountPathTLSBase + "/tls.crt"
+
+	// MountPathXtablesLock is the path at which the proxy init container mounts xtables
+	// This is necessary for xtables-legacy support
+	MountPathXtablesLock = "/run"
 
 	// IdentityServiceAccountTokenPath is the path to the kubernetes service
 	// account token used by proxies to provision identity.
 	//
 	// In the future, this should be changed to a time- and audience-scoped secret.
 	IdentityServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+	/*
+	 * Service mirror constants
+	 */
+
+	// SvcMirrorPrefix is the prefix common to all labels and annotations
+	// and types used by the service mirror component
+	SvcMirrorPrefix = "mirror.linkerd.io"
+
+	// MirrorSecretType is the type of secret that is supposed to contain
+	// the access information for remote clusters.
+	MirrorSecretType = SvcMirrorPrefix + "/remote-kubeconfig"
+
+	// DefaultExportedServiceSelector is the default label selector for exported
+	// services.
+	DefaultExportedServiceSelector = SvcMirrorPrefix + "/exported"
+
+	// MirroredResourceLabel indicates that this resource is the result
+	// of a mirroring operation (can be a namespace or a service)
+	MirroredResourceLabel = SvcMirrorPrefix + "/mirrored-service"
+
+	// MirroredGatewayLabel indicates that this is a mirrored gateway
+	MirroredGatewayLabel = SvcMirrorPrefix + "/mirrored-gateway"
+
+	// RemoteClusterNameLabel put on a local mirrored service, it
+	// allows us to associate a mirrored service with a remote cluster
+	RemoteClusterNameLabel = SvcMirrorPrefix + "/cluster-name"
+
+	// RemoteResourceVersionAnnotation is the last observed remote resource
+	// version of a mirrored resource. Useful when doing updates
+	RemoteResourceVersionAnnotation = SvcMirrorPrefix + "/remote-resource-version"
+
+	// RemoteServiceFqName is the fully qualified name of the mirrored service
+	// on the remote cluster
+	RemoteServiceFqName = SvcMirrorPrefix + "/remote-svc-fq-name"
+
+	// RemoteGatewayResourceVersionAnnotation is the last observed remote resource
+	// version of the gateway for a particular mirrored service. It is used
+	// in cases we detect a change in a remote gateway
+	RemoteGatewayResourceVersionAnnotation = SvcMirrorPrefix + "/remote-gateway-resource-version"
+
+	// RemoteGatewayIdentity follows the same kind of logic as RemoteGatewayNameLabel
+	RemoteGatewayIdentity = SvcMirrorPrefix + "/remote-gateway-identity"
+
+	// GatewayIdentity can be found on the remote gateway service
+	GatewayIdentity = SvcMirrorPrefix + "/gateway-identity"
+
+	// GatewayProbePeriod the interval at which the health of the gateway should be probed
+	GatewayProbePeriod = SvcMirrorPrefix + "/probe-period"
+
+	// GatewayProbePath the path at which the health of the gateway should be probed
+	GatewayProbePath = SvcMirrorPrefix + "/probe-path"
+
+	// ConfigKeyName is the key in the secret that stores the kubeconfig needed to connect
+	// to a remote cluster
+	ConfigKeyName = "kubeconfig"
+
+	// GatewayPortName is the name of the incoming port of the gateway
+	GatewayPortName = "mc-gateway"
+
+	// ProbePortName is the name of the probe port of the gateway
+	ProbePortName = "mc-probe"
+
+	// ServiceMirrorLabel is the value used in the controller component label
+	ServiceMirrorLabel = "servicemirror"
 )
 
 // CreatedByAnnotationValue returns the value associated with
@@ -351,16 +482,4 @@ func GetPodLabels(ownerKind, ownerName string, pod *corev1.Pod) map[string]strin
 // IsMeshed returns whether a given Pod is in a given controller's service mesh.
 func IsMeshed(pod *corev1.Pod, controllerNS string) bool {
 	return pod.Labels[ControllerNSLabel] == controllerNS
-}
-
-// IsTapDisabled returns true if the pod has an annotation for explicitly
-// disabling tap
-func IsTapDisabled(pod *corev1.Pod) bool {
-	if valStr := pod.Annotations[ProxyDisableTapAnnotation]; valStr != "" {
-		valBool, err := strconv.ParseBool(valStr)
-		if err == nil && valBool {
-			return true
-		}
-	}
-	return false
 }

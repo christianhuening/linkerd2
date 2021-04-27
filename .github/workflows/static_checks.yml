@@ -2,58 +2,96 @@ name: Static checks
 on:
   pull_request: {}
   push:
+    paths-ignore:
+    - '*.md'
+    - '**/*.md'
     branches:
-    - master
-    tags:
-    - "*"
+    - main
 jobs:
-  go_dependencies:
-    name: Go dependencies
-    runs-on: ubuntu-18.04
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: Dump env
-      run: env | sort
-    - name: Dump GitHub context
-      env:
-        GITHUB_CONTEXT: ${{ toJson(github) }}
-      run: echo "$GITHUB_CONTEXT"
-    - name: Dump job context
-      env:
-        JOB_CONTEXT: ${{ toJson(job) }}
-      run: echo "$JOB_CONTEXT"
-    - name: Validate go deps
-      run: |
-        . bin/_tag.sh
-        for f in $( grep -lR --include=Dockerfile\* go-deps: . ) ; do
-          validate_go_deps_tag $f
-        done
   go_lint:
     name: Go lint
-    runs-on: ubuntu-18.04
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
     container:
-      image: golang:1.13.4
+      image: golang:1.16.2
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
     - name: Go lint
-      env:
-        GITCOOKIE_SH: ${{ secrets.GITCOOKIE_SH }}
-      run: |
-        echo "$GITCOOKIE_SH" | bash
-        bin/lint --verbose
+      run: bin/lint --verbose
   go_format:
     name: Go format
-    runs-on: ubuntu-18.04
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
     container:
-      image: golang:1.13.4
+      image: golang:1.16.2
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
     - name: Format
-      env:
-        GITCOOKIE_SH: ${{ secrets.GITCOOKIE_SH }}
+      run: bin/fmt
+  proto_diff:
+    name: Proto diff
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
+    container:
+      image: golang:1.16.2
+    steps:
+      - name: Prerequisites
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y --no-install-recommends install unzip
+      - name: Checkout code
+        # actions/checkout@v2
+        uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+      - name: Diff proto files
+        run: bin/protoc-diff
+  shellcheck:
+    name: shellcheck
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout code
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+    - name: shellcheck
+      # For more information on shellcheck failures:
+      # https://github.com/koalaman/shellcheck/wiki/Checks
       run: |
-        echo "$GITCOOKIE_SH" | bash
-        bin/fmt
+        bin/shellcheck-all
+  psscript-analyzer:
+    name: PSScriptAnalyzer
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout code
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+    - name: Chocolatey - lint
+      # devblackops/github-action-psscriptanalyzer@v2.3.0
+      uses: devblackops/github-action-psscriptanalyzer@819c15c7d02dec0611fe3ded6f8e259b0b925754
+      env:
+        # https://github.com/devblackops/github-action-psscriptanalyzer/pull/3/files
+        INPUT_FAILONWARNING: 1
+      with:
+        rootPath: bin/win/tools
+        failOnInfos: true
+  markdown_lint:
+    name: Markdown lint
+    timeout-minutes: 10
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout code
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+    - name: Markdown lint
+      run: bin/markdownlint-all
+  chart_docs_diff:
+    name: Chart readme diff check
+    runs-on: ubuntu-20.04
+    steps:
+    - name: Checkout code
+      # actions/checkout@v2
+      uses: actions/checkout@722adc63f1aa60a57ec37892e133b1d319cae598
+    - name: Check docs for diff
+      run: bin/helm-docs-diff

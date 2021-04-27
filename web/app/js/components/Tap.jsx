@@ -5,6 +5,7 @@ import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.
 import ErrorBanner from './ErrorBanner.jsx';
 import PropTypes from 'prop-types';
 import React from 'react';
+import TapEnabledWarning from './TapEnabledWarning.jsx';
 import TapEventTable from './TapEventTable.jsx';
 import TapQueryForm from './TapQueryForm.jsx';
 import _cloneDeep from 'lodash/cloneDeep';
@@ -50,6 +51,7 @@ class Tap extends React.Component {
       tapIsClosing: false,
       pollingInterval: 10000,
       pendingRequests: false,
+      showTapEnabledWarning: false,
     };
   }
 
@@ -125,6 +127,10 @@ class Tap extends React.Component {
           error: {
             error: e.reason,
           },
+        });
+      } else if (e.reason.includes('no pods to tap')) {
+        this.setState({
+          showTapEnabledWarning: true,
         });
       } else {
         this.setState({
@@ -248,6 +254,7 @@ class Tap extends React.Component {
     this.setState({
       tapResultsById: {},
       query: emptyTapQuery(),
+      showTapEnabledWarning: false,
     });
   }
 
@@ -262,11 +269,12 @@ class Tap extends React.Component {
     });
 
     const url = this.api.urlsForResourceNoStats('all');
-    this.api.setCurrentRequests([this.api.fetchMetrics(url)]);
+    const authorityUrl = this.api.urlsForResource('authority');
+    this.api.setCurrentRequests([this.api.fetchMetrics(url), this.api.fetchMetrics(authorityUrl)]);
     this.serverPromise = Promise.all(this.api.getCurrentPromises())
-      .then(([rsp]) => {
-        const { resourcesByNs, authoritiesByNs } = groupResourcesByNs(rsp);
-
+      .then(rsp => {
+        const { resourcesByNs } = groupResourcesByNs(rsp[0]);
+        const { authoritiesByNs } = groupResourcesByNs(rsp[1]);
         this.setState({
           resourcesByNs,
           authoritiesByNs,
@@ -290,11 +298,12 @@ class Tap extends React.Component {
   updateQuery = query => {
     this.setState({
       query,
+      showTapEnabledWarning: false,
     });
   }
 
   render() {
-    const { tapResultsById, tapRequestInProgress, tapIsClosing, resourcesByNs, authoritiesByNs, query, error } = this.state;
+    const { tapResultsById, tapRequestInProgress, tapIsClosing, resourcesByNs, authoritiesByNs, query, showTapEnabledWarning, error } = this.state;
     const tableRows = _orderBy(_values(tapResultsById), r => r.lastUpdated, 'desc');
 
     return (
@@ -313,10 +322,17 @@ class Tap extends React.Component {
           authoritiesByNs={authoritiesByNs}
           updateQuery={this.updateQuery}
           currentQuery={query} />
-
-        <TapEventTable
-          resource={query.resource}
-          tableRows={tableRows} />
+        {showTapEnabledWarning &&
+          <TapEnabledWarning
+            resource={query.resource}
+            namespace={query.namespace}
+            cardComponent />
+        }
+        {!showTapEnabledWarning &&
+          <TapEventTable
+            resource={query.resource}
+            tableRows={tableRows} />
+        }
       </div>
     );
   }

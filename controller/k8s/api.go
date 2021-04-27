@@ -6,14 +6,16 @@ import (
 	"strings"
 	"time"
 
-	tsclient "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
-	ts "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/informers/externalversions"
-	tsinformers "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/informers/externalversions/split/v1alpha1"
+	"k8s.io/client-go/rest"
+
 	spv1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	spclient "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned"
 	sp "github.com/linkerd/linkerd2/controller/gen/client/informers/externalversions"
 	spinformers "github.com/linkerd/linkerd2/controller/gen/client/informers/externalversions/serviceprofile/v1alpha2"
 	"github.com/linkerd/linkerd2/pkg/k8s"
+	tsclient "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
+	ts "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/informers/externalversions"
+	tsinformers "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/informers/externalversions/split/v1alpha1"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,6 +34,7 @@ import (
 	batchv1informers "k8s.io/client-go/informers/batch/v1"
 	batchv1beta1informers "k8s.io/client-go/informers/batch/v1beta1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	discoveryinformers "k8s.io/client-go/informers/discovery/v1beta1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
@@ -58,6 +61,8 @@ const (
 	Svc
 	TS
 	Node
+	Secret
+	ES // EndpointSlice resource
 )
 
 // API provides shared informers for all Kubernetes objects
@@ -69,6 +74,7 @@ type API struct {
 	deploy   appv1informers.DeploymentInformer
 	ds       appv1informers.DaemonSetInformer
 	endpoint coreinformers.EndpointsInformer
+	es       discoveryinformers.EndpointSliceInformer
 	job      batchv1informers.JobInformer
 	mwc      arinformers.MutatingWebhookConfigurationInformer
 	ns       coreinformers.NamespaceInformer
@@ -80,6 +86,7 @@ type API struct {
 	svc      coreinformers.ServiceInformer
 	ts       tsinformers.TrafficSplitInformer
 	node     coreinformers.NodeInformer
+	secret   coreinformers.SecretInformer
 
 	syncChecks        []cache.InformerSynced
 	sharedInformers   informers.SharedInformerFactory
@@ -88,23 +95,46 @@ type API struct {
 }
 
 // InitializeAPI creates Kubernetes clients and returns an initialized API wrapper.
-func InitializeAPI(kubeConfig string, resources ...APIResource) (*API, error) {
-	k8sClient, err := k8s.NewAPI(kubeConfig, "", "", []string{}, 0)
+func InitializeAPI(ctx context.Context, kubeConfig string, ensureClusterWideAccess bool, resources ...APIResource) (*API, error) {
+	config, err := k8s.GetConfig(kubeConfig, "")
+	if err != nil {
+		return nil, fmt.Errorf("error configuring Kubernetes API client: %v", err)
+	}
+
+	k8sClient, err := k8s.NewAPIForConfig(config, "", []string{}, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	// check for cluster-wide access
-	err = k8s.ClusterAccess(k8sClient)
+	return initAPI(ctx, k8sClient, config, ensureClusterWideAccess, resources...)
+}
+
+// InitializeAPIForConfig creates Kubernetes clients and returns an initialized API wrapper.
+func InitializeAPIForConfig(ctx context.Context, kubeConfig *rest.Config, ensureClusterWideAccess bool, resources ...APIResource) (*API, error) {
+	k8sClient, err := k8s.NewAPIForConfig(kubeConfig, "", []string{}, 0)
 	if err != nil {
 		return nil, err
+	}
+
+	return initAPI(ctx, k8sClient, kubeConfig, ensureClusterWideAccess, resources...)
+}
+
+func initAPI(ctx context.Context, k8sClient *k8s.KubernetesAPI, kubeConfig *rest.Config, ensureClusterWideAccess bool, resources ...APIResource) (*API, error) {
+	// check for cluster-wide access
+	var err error
+
+	if ensureClusterWideAccess {
+		err := k8s.ClusterAccess(ctx, k8sClient)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// check for need and access to ServiceProfiles
 	var spClient *spclient.Clientset
 	for _, res := range resources {
 		if res == SP {
-			err := k8s.ServiceProfilesAccess(k8sClient)
+			err := k8s.ServiceProfilesAccess(ctx, k8sClient)
 			if err != nil {
 				return nil, err
 			}
@@ -177,6 +207,9 @@ func NewAPI(
 		case Endpoint:
 			api.endpoint = sharedInformers.Core().V1().Endpoints()
 			api.syncChecks = append(api.syncChecks, api.endpoint.Informer().HasSynced)
+		case ES:
+			api.es = sharedInformers.Discovery().V1beta1().EndpointSlices()
+			api.syncChecks = append(api.syncChecks, api.es.Informer().HasSynced)
 		case Job:
 			api.job = sharedInformers.Batch().V1().Jobs()
 			api.syncChecks = append(api.syncChecks, api.job.Informer().HasSynced)
@@ -196,6 +229,9 @@ func NewAPI(
 			api.rs = sharedInformers.Apps().V1().ReplicaSets()
 			api.syncChecks = append(api.syncChecks, api.rs.Informer().HasSynced)
 		case SP:
+			if spSharedInformers == nil {
+				panic("SP shared informer not configured")
+			}
 			api.sp = spSharedInformers.Linkerd().V1alpha2().ServiceProfiles()
 			api.syncChecks = append(api.syncChecks, api.sp.Informer().HasSynced)
 		case SS:
@@ -205,22 +241,27 @@ func NewAPI(
 			api.svc = sharedInformers.Core().V1().Services()
 			api.syncChecks = append(api.syncChecks, api.svc.Informer().HasSynced)
 		case TS:
+			if tsSharedInformers == nil {
+				panic("TS shared informer not configured")
+			}
 			api.ts = tsSharedInformers.Split().V1alpha1().TrafficSplits()
 			api.syncChecks = append(api.syncChecks, api.ts.Informer().HasSynced)
 		case Node:
 			api.node = sharedInformers.Core().V1().Nodes()
 			api.syncChecks = append(api.syncChecks, api.node.Informer().HasSynced)
+		case Secret:
+			api.secret = sharedInformers.Core().V1().Secrets()
+			api.syncChecks = append(api.syncChecks, api.secret.Informer().HasSynced)
 		}
 	}
-
 	return api
 }
 
 // Sync waits for all informers to be synced.
-func (api *API) Sync() {
-	api.sharedInformers.Start(nil)
-	api.spSharedInformers.Start(nil)
-	api.tsSharedInformers.Start(nil)
+func (api *API) Sync(stopCh <-chan struct{}) {
+	api.sharedInformers.Start(stopCh)
+	api.spSharedInformers.Start(stopCh)
+	api.tsSharedInformers.Start(stopCh)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -305,6 +346,14 @@ func (api *API) Endpoint() coreinformers.EndpointsInformer {
 	return api.endpoint
 }
 
+// ES provides access to a shared informer and lister for EndpointSlices
+func (api *API) ES() discoveryinformers.EndpointSliceInformer {
+	if api.es == nil {
+		panic("EndpointSlices informer not configured")
+	}
+	return api.es
+}
+
 // CM provides access to a shared informer and lister for ConfigMaps.
 func (api *API) CM() coreinformers.ConfigMapInformer {
 	if api.cm == nil {
@@ -359,6 +408,14 @@ func (api *API) Node() coreinformers.NodeInformer {
 	return api.node
 }
 
+// Secret provides access to a shared informer and lister for Secrets.
+func (api *API) Secret() coreinformers.SecretInformer {
+	if api.secret == nil {
+		panic("Secret informer not configured")
+	}
+	return api.secret
+}
+
 // CJ provides access to a shared informer and lister for CronJobs.
 func (api *API) CJ() batchv1beta1informers.CronJobInformer {
 	if api.cj == nil {
@@ -367,31 +424,32 @@ func (api *API) CJ() batchv1beta1informers.CronJobInformer {
 	return api.cj
 }
 
-// GetObjects returns a list of Kubernetes objects, given a namespace, type, and name.
+// GetObjects returns a list of Kubernetes objects, given a namespace, type, name and label selector.
 // If namespace is an empty string, match objects in all namespaces.
 // If name is an empty string, match all objects of the given type.
-func (api *API) GetObjects(namespace, restype, name string) ([]runtime.Object, error) {
+// If label selector is an empty string, match all labels.
+func (api *API) GetObjects(namespace, restype, name string, label labels.Selector) ([]runtime.Object, error) {
 	switch restype {
 	case k8s.Namespace:
-		return api.getNamespaces(name)
+		return api.getNamespaces(name, label)
 	case k8s.CronJob:
-		return api.getCronjobs(namespace, name)
+		return api.getCronjobs(namespace, name, label)
 	case k8s.DaemonSet:
-		return api.getDaemonsets(namespace, name)
+		return api.getDaemonsets(namespace, name, label)
 	case k8s.Deployment:
-		return api.getDeployments(namespace, name)
+		return api.getDeployments(namespace, name, label)
 	case k8s.Job:
-		return api.getJobs(namespace, name)
+		return api.getJobs(namespace, name, label)
 	case k8s.Pod:
-		return api.getPods(namespace, name)
+		return api.getPods(namespace, name, label)
 	case k8s.ReplicationController:
-		return api.getRCs(namespace, name)
+		return api.getRCs(namespace, name, label)
 	case k8s.ReplicaSet:
-		return api.getReplicasets(namespace, name)
+		return api.getReplicasets(namespace, name, label)
 	case k8s.Service:
 		return api.getServices(namespace, name)
 	case k8s.StatefulSet:
-		return api.getStatefulsets(namespace, name)
+		return api.getStatefulsets(namespace, name, label)
 	default:
 		return nil, status.Errorf(codes.Unimplemented, "unimplemented resource type: %s", restype)
 	}
@@ -402,7 +460,7 @@ func (api *API) GetObjects(namespace, restype, name string) ([]runtime.Object, e
 // singular resource type (e.g. deployment, daemonset, job, etc.).
 // If retry is true, when the shared informer cache doesn't return anything
 // we try again with a direct Kubernetes API call.
-func (api *API) GetOwnerKindAndName(pod *corev1.Pod, retry bool) (string, string) {
+func (api *API) GetOwnerKindAndName(ctx context.Context, pod *corev1.Pod, retry bool) (string, string) {
 	ownerRefs := pod.GetOwnerReferences()
 	if len(ownerRefs) == 0 {
 		// pod without a parent
@@ -421,7 +479,7 @@ func (api *API) GetOwnerKindAndName(pod *corev1.Pod, retry bool) (string, string
 		if err != nil {
 			log.Warnf("failed to retrieve job from indexer %s/%s: %s", pod.Namespace, parent.Name, err)
 			if retry {
-				parentObj, err = api.Client.BatchV1().Jobs(pod.Namespace).Get(parent.Name, metav1.GetOptions{})
+				parentObj, err = api.Client.BatchV1().Jobs(pod.Namespace).Get(ctx, parent.Name, metav1.GetOptions{})
 				if err != nil {
 					log.Warnf("failed to retrieve job from direct API call %s/%s: %s", pod.Namespace, parent.Name, err)
 				}
@@ -432,7 +490,7 @@ func (api *API) GetOwnerKindAndName(pod *corev1.Pod, retry bool) (string, string
 		if err != nil {
 			log.Warnf("failed to retrieve replicaset from indexer %s/%s: %s", pod.Namespace, parent.Name, err)
 			if retry {
-				parentObj, err = api.Client.AppsV1().ReplicaSets(pod.Namespace).Get(parent.Name, metav1.GetOptions{})
+				parentObj, err = api.Client.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, parent.Name, metav1.GetOptions{})
 				if err != nil {
 					log.Warnf("failed to retrieve replicaset from direct API call %s/%s: %s", pod.Namespace, parent.Name, err)
 				}
@@ -524,7 +582,11 @@ func (api *API) GetPodsFor(obj runtime.Object, includeFailed bool) ([]*corev1.Po
 			return []*corev1.Pod{}, nil
 		}
 		namespace = typed.Namespace
-		selector = labels.Set(typed.Spec.Selector).AsSelector()
+		if typed.Spec.Selector == nil {
+			selector = labels.Nothing()
+		} else {
+			selector = labels.Set(typed.Spec.Selector).AsSelector()
+		}
 
 	case *appsv1.StatefulSet:
 		namespace = typed.Namespace
@@ -632,12 +694,12 @@ func GetNamespaceOf(obj runtime.Object) (string, error) {
 
 // getNamespaces returns the namespace matching the specified name. If no name
 // is given, it returns all namespaces.
-func (api *API) getNamespaces(name string) ([]runtime.Object, error) {
+func (api *API) getNamespaces(name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var namespaces []*corev1.Namespace
 
 	if name == "" {
 		var err error
-		namespaces, err = api.NS().Lister().List(labels.Everything())
+		namespaces, err = api.NS().Lister().List(labelSelector)
 		if err != nil {
 			return nil, err
 		}
@@ -657,14 +719,14 @@ func (api *API) getNamespaces(name string) ([]runtime.Object, error) {
 	return objects, nil
 }
 
-func (api *API) getDeployments(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getDeployments(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var deploys []*appsv1.Deployment
 
 	if namespace == "" {
-		deploys, err = api.Deploy().Lister().List(labels.Everything())
+		deploys, err = api.Deploy().Lister().List(labelSelector)
 	} else if name == "" {
-		deploys, err = api.Deploy().Lister().Deployments(namespace).List(labels.Everything())
+		deploys, err = api.Deploy().Lister().Deployments(namespace).List(labelSelector)
 	} else {
 		var deploy *appsv1.Deployment
 		deploy, err = api.Deploy().Lister().Deployments(namespace).Get(name)
@@ -683,14 +745,14 @@ func (api *API) getDeployments(namespace, name string) ([]runtime.Object, error)
 	return objects, nil
 }
 
-func (api *API) getPods(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getPods(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var pods []*corev1.Pod
 
 	if namespace == "" {
-		pods, err = api.Pod().Lister().List(labels.Everything())
+		pods, err = api.Pod().Lister().List(labelSelector)
 	} else if name == "" {
-		pods, err = api.Pod().Lister().Pods(namespace).List(labels.Everything())
+		pods, err = api.Pod().Lister().Pods(namespace).List(labelSelector)
 	} else {
 		var pod *corev1.Pod
 		pod, err = api.Pod().Lister().Pods(namespace).Get(name)
@@ -712,14 +774,14 @@ func (api *API) getPods(namespace, name string) ([]runtime.Object, error) {
 	return objects, nil
 }
 
-func (api *API) getRCs(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getRCs(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var rcs []*corev1.ReplicationController
 
 	if namespace == "" {
-		rcs, err = api.RC().Lister().List(labels.Everything())
+		rcs, err = api.RC().Lister().List(labelSelector)
 	} else if name == "" {
-		rcs, err = api.RC().Lister().ReplicationControllers(namespace).List(labels.Everything())
+		rcs, err = api.RC().Lister().ReplicationControllers(namespace).List(labelSelector)
 	} else {
 		var rc *corev1.ReplicationController
 		rc, err = api.RC().Lister().ReplicationControllers(namespace).Get(name)
@@ -738,14 +800,14 @@ func (api *API) getRCs(namespace, name string) ([]runtime.Object, error) {
 	return objects, nil
 }
 
-func (api *API) getDaemonsets(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getDaemonsets(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var daemonsets []*appsv1.DaemonSet
 
 	if namespace == "" {
-		daemonsets, err = api.DS().Lister().List(labels.Everything())
+		daemonsets, err = api.DS().Lister().List(labelSelector)
 	} else if name == "" {
-		daemonsets, err = api.DS().Lister().DaemonSets(namespace).List(labels.Everything())
+		daemonsets, err = api.DS().Lister().DaemonSets(namespace).List(labelSelector)
 	} else {
 		var ds *appsv1.DaemonSet
 		ds, err = api.DS().Lister().DaemonSets(namespace).Get(name)
@@ -764,14 +826,14 @@ func (api *API) getDaemonsets(namespace, name string) ([]runtime.Object, error) 
 	return objects, nil
 }
 
-func (api *API) getStatefulsets(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getStatefulsets(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var statefulsets []*appsv1.StatefulSet
 
 	if namespace == "" {
-		statefulsets, err = api.SS().Lister().List(labels.Everything())
+		statefulsets, err = api.SS().Lister().List(labelSelector)
 	} else if name == "" {
-		statefulsets, err = api.SS().Lister().StatefulSets(namespace).List(labels.Everything())
+		statefulsets, err = api.SS().Lister().StatefulSets(namespace).List(labelSelector)
 	} else {
 		var ss *appsv1.StatefulSet
 		ss, err = api.SS().Lister().StatefulSets(namespace).Get(name)
@@ -790,14 +852,14 @@ func (api *API) getStatefulsets(namespace, name string) ([]runtime.Object, error
 	return objects, nil
 }
 
-func (api *API) getJobs(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getJobs(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var jobs []*batchv1.Job
 
 	if namespace == "" {
-		jobs, err = api.Job().Lister().List(labels.Everything())
+		jobs, err = api.Job().Lister().List(labelSelector)
 	} else if name == "" {
-		jobs, err = api.Job().Lister().Jobs(namespace).List(labels.Everything())
+		jobs, err = api.Job().Lister().Jobs(namespace).List(labelSelector)
 	} else {
 		var job *batchv1.Job
 		job, err = api.Job().Lister().Jobs(namespace).Get(name)
@@ -831,14 +893,14 @@ func (api *API) getServices(namespace, name string) ([]runtime.Object, error) {
 	return objects, nil
 }
 
-func (api *API) getCronjobs(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getCronjobs(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var cronjobs []*batchv1beta1.CronJob
 
 	if namespace == "" {
-		cronjobs, err = api.CJ().Lister().List(labels.Everything())
+		cronjobs, err = api.CJ().Lister().List(labelSelector)
 	} else if name == "" {
-		cronjobs, err = api.CJ().Lister().CronJobs(namespace).List(labels.Everything())
+		cronjobs, err = api.CJ().Lister().CronJobs(namespace).List(labelSelector)
 	} else {
 		var cronjob *batchv1beta1.CronJob
 		cronjob, err = api.CJ().Lister().CronJobs(namespace).Get(name)
@@ -856,14 +918,14 @@ func (api *API) getCronjobs(namespace, name string) ([]runtime.Object, error) {
 	return objects, nil
 }
 
-func (api *API) getReplicasets(namespace, name string) ([]runtime.Object, error) {
+func (api *API) getReplicasets(namespace, name string, labelSelector labels.Selector) ([]runtime.Object, error) {
 	var err error
 	var replicasets []*appsv1.ReplicaSet
 
 	if namespace == "" {
-		replicasets, err = api.RS().Lister().List(labels.Everything())
+		replicasets, err = api.RS().Lister().List(labelSelector)
 	} else if name == "" {
-		replicasets, err = api.RS().Lister().ReplicaSets(namespace).List(labels.Everything())
+		replicasets, err = api.RS().Lister().ReplicaSets(namespace).List(labelSelector)
 	} else {
 		var replicaset *appsv1.ReplicaSet
 		replicaset, err = api.RS().Lister().ReplicaSets(namespace).Get(name)

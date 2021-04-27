@@ -60,6 +60,8 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
   const podsPath = '/api/pods';
   const servicesPath = '/api/services';
   const edgesPath = '/api/edges';
+  const gatewaysPath = '/api/gateways';
+  const l5dExtensionsPath = '/api/extension';
 
   const validMetricsWindows = {
     '10s': '10 minutes',
@@ -136,8 +138,16 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
     return apiFetch(`${edgesPath}?resource_type=${resourceType}&namespace=${namespace}`);
   };
 
+  const fetchGateways = () => {
+    return apiFetch(gatewaysPath);
+  };
+
   const fetchCheck = () => {
     return apiFetch('/api/check');
+  };
+
+  const fetchExtension = name => {
+    return apiFetch(`${l5dExtensionsPath}?extension_name=${name}`);
   };
 
   const fetchResourceDefinition = (namespace, resourceType, resourceName) => {
@@ -249,6 +259,8 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
     fetchPods,
     fetchServices,
     fetchEdges,
+    fetchGateways,
+    fetchExtension,
     fetchCheck,
     fetchResourceDefinition,
     getMetricsWindow,

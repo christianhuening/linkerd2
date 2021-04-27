@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	charts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 )
 
 // TestUninjectYAML does the reverse of TestInjectYAML.
@@ -60,11 +62,6 @@ func TestUninjectYAML(t *testing.T) {
 			reportFileName: "inject_emojivoto_pod_uninject.report",
 		},
 		{
-			inputFileName:  "inject_emojivoto_pod_with_requests.golden.yml",
-			goldenFileName: "inject_emojivoto_pod_with_requests.input.yml",
-			reportFileName: "inject_emojivoto_pod_with_requests_uninject.report",
-		},
-		{
 			inputFileName:  "inject_emojivoto_deployment_udp.golden.yml",
 			goldenFileName: "inject_emojivoto_deployment_udp.input.yml",
 			reportFileName: "inject_emojivoto_deployment_udp_uninject.report",
@@ -75,7 +72,7 @@ func TestUninjectYAML(t *testing.T) {
 			reportFileName: "inject_emojivoto_istio_uninject.report",
 		},
 		{
-			inputFileName:  "inject_contour.input.yml",
+			inputFileName:  "inject_contour.golden.yml",
 			goldenFileName: "inject_contour.input.yml",
 			reportFileName: "inject_contour_uninject.report",
 		},
@@ -96,6 +93,11 @@ func TestUninjectYAML(t *testing.T) {
 		},
 	}
 
+	values, err := charts.NewValues()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for i, tc := range testCases {
 		tc := tc // pin
 		t.Run(fmt.Sprintf("%d: %s", i, tc.inputFileName), func(t *testing.T) {
@@ -109,13 +111,13 @@ func TestUninjectYAML(t *testing.T) {
 			output := new(bytes.Buffer)
 			report := new(bytes.Buffer)
 
-			exitCode := runUninjectCmd(read, report, output, nil)
+			exitCode := runUninjectCmd(read, report, output, values)
 			if exitCode != 0 {
-				t.Errorf("Failed to inject %s\n", tc.inputFileName)
+				t.Errorf("Failed to uninject %s\n", tc.inputFileName)
 			}
 
-			diffTestdata(t, tc.goldenFileName, output.String())
-			diffTestdata(t, tc.reportFileName, report.String())
+			testDataDiffer.DiffTestdata(t, tc.goldenFileName, output.String())
+			testDataDiffer.DiffTestdata(t, tc.reportFileName, report.String())
 		})
 	}
 }

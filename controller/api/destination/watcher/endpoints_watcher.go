@@ -1,42 +1,62 @@
 package watcher
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/linkerd/linkerd2/controller/k8s"
+	consts "github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/prometheus/client_golang/prometheus"
 	logging "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/cache"
 )
 
 const (
 	kubeSystem = "kube-system"
-	podIPIndex = "ip"
+
+	// metrics labels
+	service                = "service"
+	namespace              = "namespace"
+	targetCluster          = "target_cluster"
+	targetService          = "target_service"
+	targetServiceNamespace = "target_service_namespace"
 )
+
+const endpointTargetRefPod = "Pod"
 
 // TODO: prom metrics for all the queues/caches
 // https://github.com/linkerd/linkerd2/issues/2204
 
 type (
-	// Address represents an individual port on an specific pod.
+	// Address represents an individual port on a specific endpoint.
+	// This endpoint might be the result of a the existence of a pod
+	// that is targeted by this service; alternatively it can be the
+	// case that this endpoint is not associated with a pod and maps
+	// to some other IP (i.e. a remote service gateway)
 	Address struct {
-		IP        string
-		Port      Port
-		Pod       *corev1.Pod
-		OwnerName string
-		OwnerKind string
+		IP                string
+		Port              Port
+		Pod               *corev1.Pod
+		OwnerName         string
+		OwnerKind         string
+		Identity          string
+		AuthorityOverride string
+		TopologyLabels    map[string]string
 	}
 
-	// PodSet is a set of pods, indexed by IP.
-	PodSet struct {
-		Pods   map[PodID]Address
-		Labels map[string]string
+	// AddressSet is a set of Address, indexed by ID.
+	AddressSet struct {
+		Addresses       map[ID]Address
+		Labels          map[string]string
+		TopologicalPref []string
 	}
 
 	portAndHostname struct {
@@ -52,8 +72,9 @@ type (
 		publishers map[ServiceID]*servicePublisher
 		k8sAPI     *k8s.API
 
-		log          *logging.Entry
-		sync.RWMutex // This mutex protects modification of the map itself.
+		log                  *logging.Entry
+		enableEndpointSlices bool
+		sync.RWMutex         // This mutex protects modification of the map itself.
 	}
 
 	// servicePublisher represents a service.  It keeps a map of portPublishers
@@ -66,11 +87,13 @@ type (
 	// requested, the address set will be filtered to only include addresses
 	// with the requested hostname.
 	servicePublisher struct {
-		id     ServiceID
-		log    *logging.Entry
-		k8sAPI *k8s.API
+		id                   ServiceID
+		log                  *logging.Entry
+		k8sAPI               *k8s.API
+		enableEndpointSlices bool
 
-		ports map[portAndHostname]*portPublisher
+		TopologyPref []string
+		ports        map[portAndHostname]*portPublisher
 		// All access to the servicePublisher and its portPublishers is explicitly synchronized by
 		// this mutex.
 		sync.Mutex
@@ -82,45 +105,45 @@ type (
 	// publishes diffs to all listeners when updates come from either the
 	// endpoints API or the service API.
 	portPublisher struct {
-		id         ServiceID
-		targetPort namedPort
-		hostname   string
-		log        *logging.Entry
-		k8sAPI     *k8s.API
+		id                   ServiceID
+		targetPort           namedPort
+		srcPort              Port
+		hostname             string
+		log                  *logging.Entry
+		k8sAPI               *k8s.API
+		enableEndpointSlices bool
+		TopologyPref         []string
 
 		exists    bool
-		pods      PodSet
+		addresses AddressSet
 		listeners []EndpointUpdateListener
 		metrics   endpointsMetrics
 	}
 
 	// EndpointUpdateListener is the interface that subscribers must implement.
 	EndpointUpdateListener interface {
-		Add(set PodSet)
-		Remove(set PodSet)
+		Add(set AddressSet)
+		Remove(set AddressSet)
 		NoEndpoints(exists bool)
 	}
 )
 
 var endpointsVecs = newEndpointsMetricsVecs()
 
+var undefinedEndpointPort = Port(0)
+
 // NewEndpointsWatcher creates an EndpointsWatcher and begins watching the
-// k8sAPI for pod, service, and endpoint changes.
-func NewEndpointsWatcher(k8sAPI *k8s.API, log *logging.Entry) *EndpointsWatcher {
+// k8sAPI for pod, service, and endpoint changes. An EndpointsWatcher will
+// watch on Endpoints or EndpointSlice resources, depending on cluster configuration.
+func NewEndpointsWatcher(k8sAPI *k8s.API, log *logging.Entry, enableEndpointSlices bool) *EndpointsWatcher {
 	ew := &EndpointsWatcher{
-		publishers: make(map[ServiceID]*servicePublisher),
-		k8sAPI:     k8sAPI,
+		publishers:           make(map[ServiceID]*servicePublisher),
+		k8sAPI:               k8sAPI,
+		enableEndpointSlices: enableEndpointSlices,
 		log: log.WithFields(logging.Fields{
 			"component": "endpoints-watcher",
 		}),
 	}
-
-	k8sAPI.Pod().Informer().AddIndexers(cache.Indexers{podIPIndex: func(obj interface{}) ([]string, error) {
-		if pod, ok := obj.(*corev1.Pod); ok {
-			return []string{pod.Status.PodIP}, nil
-		}
-		return []string{""}, fmt.Errorf("object is not a pod")
-	}})
 
 	k8sAPI.Svc().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    ew.addService,
@@ -128,12 +151,21 @@ func NewEndpointsWatcher(k8sAPI *k8s.API, log *logging.Entry) *EndpointsWatcher 
 		UpdateFunc: func(_, obj interface{}) { ew.addService(obj) },
 	})
 
-	k8sAPI.Endpoint().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    ew.addEndpoints,
-		DeleteFunc: ew.deleteEndpoints,
-		UpdateFunc: func(_, obj interface{}) { ew.addEndpoints(obj) },
-	})
-
+	if ew.enableEndpointSlices {
+		ew.log.Debugf("Watching EndpointSlice resources")
+		k8sAPI.ES().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    ew.addEndpointSlice,
+			DeleteFunc: ew.deleteEndpointSlice,
+			UpdateFunc: ew.updateEndpointSlice,
+		})
+	} else {
+		ew.log.Debugf("Watching Endpoints resources")
+		k8sAPI.Endpoint().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    ew.addEndpoints,
+			DeleteFunc: ew.deleteEndpoints,
+			UpdateFunc: func(_, obj interface{}) { ew.addEndpoints(obj) },
+		})
+	}
 	return ew
 }
 
@@ -194,7 +226,20 @@ func (ew *EndpointsWatcher) addService(obj interface{}) {
 }
 
 func (ew *EndpointsWatcher) deleteService(obj interface{}) {
-	service := obj.(*corev1.Service)
+	service, ok := obj.(*corev1.Service)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			ew.log.Errorf("couldn't get object from DeletedFinalStateUnknown %#v", obj)
+			return
+		}
+		service, ok = tombstone.Obj.(*corev1.Service)
+		if !ok {
+			ew.log.Errorf("DeletedFinalStateUnknown contained object that is not a Service %#v", obj)
+			return
+		}
+	}
+
 	if service.Namespace == kubeSystem {
 		return
 	}
@@ -210,22 +255,35 @@ func (ew *EndpointsWatcher) deleteService(obj interface{}) {
 }
 
 func (ew *EndpointsWatcher) addEndpoints(obj interface{}) {
-	endpoints := obj.(*corev1.Endpoints)
+	endpoints, ok := obj.(*corev1.Endpoints)
+	if !ok {
+		ew.log.Errorf("error processing endpoints resource, got %#v expected *corev1.Endpoints", obj)
+		return
+	}
+
 	if endpoints.Namespace == kubeSystem {
 		return
 	}
-	id := ServiceID{
-		Namespace: endpoints.Namespace,
-		Name:      endpoints.Name,
-	}
-
+	id := ServiceID{endpoints.Namespace, endpoints.Name}
 	sp := ew.getOrNewServicePublisher(id)
-
 	sp.updateEndpoints(endpoints)
 }
 
 func (ew *EndpointsWatcher) deleteEndpoints(obj interface{}) {
-	endpoints := obj.(*corev1.Endpoints)
+	endpoints, ok := obj.(*corev1.Endpoints)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			ew.log.Errorf("couldn't get object from DeletedFinalStateUnknown %#v", obj)
+			return
+		}
+		endpoints, ok = tombstone.Obj.(*corev1.Endpoints)
+		if !ok {
+			ew.log.Errorf("DeletedFinalStateUnknown contained object that is not an Endpoints %#v", obj)
+			return
+		}
+	}
+
 	if endpoints.Namespace == kubeSystem {
 		return
 	}
@@ -237,6 +295,84 @@ func (ew *EndpointsWatcher) deleteEndpoints(obj interface{}) {
 	sp, ok := ew.getServicePublisher(id)
 	if ok {
 		sp.deleteEndpoints()
+	}
+}
+
+func (ew *EndpointsWatcher) addEndpointSlice(obj interface{}) {
+	newSlice, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		ew.log.Errorf("error processing EndpointSlice resource, got %#v expected *discovery.EndpointSlice", obj)
+		return
+	}
+
+	if newSlice.Namespace == kubeSystem {
+		return
+	}
+
+	id, err := getEndpointSliceServiceID(newSlice)
+	if err != nil {
+		ew.log.Errorf("Could not fetch resource service name:%v", err)
+		return
+	}
+
+	sp := ew.getOrNewServicePublisher(id)
+	sp.addEndpointSlice(newSlice)
+}
+
+func (ew *EndpointsWatcher) updateEndpointSlice(oldObj interface{}, newObj interface{}) {
+	oldSlice, ok := oldObj.(*discovery.EndpointSlice)
+	if !ok {
+		ew.log.Errorf("error processing EndpointSlice resource, got %#v expected *discovery.EndpointSlice", oldObj)
+		return
+	}
+	newSlice, ok := newObj.(*discovery.EndpointSlice)
+	if !ok {
+		ew.log.Errorf("error processing EndpointSlice resource, got %#v expected *discovery.EndpointSlice", newObj)
+		return
+	}
+
+	if newSlice.Namespace == kubeSystem {
+		return
+	}
+
+	id, err := getEndpointSliceServiceID(newSlice)
+	if err != nil {
+		ew.log.Errorf("Could not fetch resource service name:%v", err)
+		return
+	}
+
+	sp, ok := ew.getServicePublisher(id)
+	if ok {
+		sp.updateEndpointSlice(oldSlice, newSlice)
+	}
+}
+
+func (ew *EndpointsWatcher) deleteEndpointSlice(obj interface{}) {
+	es, ok := obj.(*discovery.EndpointSlice)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			ew.log.Errorf("couldn't get object from DeletedFinalStateUnknown %#v", obj)
+		}
+		es, ok = tombstone.Obj.(*discovery.EndpointSlice)
+		if !ok {
+			ew.log.Errorf("DeletedFinalStateUnknown contained object that is not an EndpointSlice %#v", obj)
+			return
+		}
+	}
+
+	if es.Namespace == kubeSystem {
+		return
+	}
+
+	id, err := getEndpointSliceServiceID(es)
+	if err != nil {
+		ew.log.Errorf("Could not fetch resource service name:%v", err)
+	}
+
+	sp, ok := ew.getServicePublisher(id)
+	if ok {
+		sp.deleteEndpointSlice(es)
 	}
 }
 
@@ -257,8 +393,10 @@ func (ew *EndpointsWatcher) getOrNewServicePublisher(id ServiceID) *servicePubli
 				"ns":        id.Namespace,
 				"svc":       id.Name,
 			}),
-			k8sAPI: ew.k8sAPI,
-			ports:  make(map[portAndHostname]*portPublisher),
+			k8sAPI:               ew.k8sAPI,
+			TopologyPref:         make([]string, 0),
+			ports:                make(map[portAndHostname]*portPublisher),
+			enableEndpointSlices: ew.enableEndpointSlices,
 		}
 		ew.publishers[id] = sp
 	}
@@ -280,7 +418,6 @@ func (sp *servicePublisher) updateEndpoints(newEndpoints *corev1.Endpoints) {
 	sp.Lock()
 	defer sp.Unlock()
 	sp.log.Debugf("Updating endpoints for %s", sp.id)
-
 	for _, port := range sp.ports {
 		port.updateEndpoints(newEndpoints)
 	}
@@ -290,9 +427,35 @@ func (sp *servicePublisher) deleteEndpoints() {
 	sp.Lock()
 	defer sp.Unlock()
 	sp.log.Debugf("Deleting endpoints for %s", sp.id)
-
 	for _, port := range sp.ports {
 		port.noEndpoints(false)
+	}
+}
+
+func (sp *servicePublisher) addEndpointSlice(newSlice *discovery.EndpointSlice) {
+	sp.Lock()
+	defer sp.Unlock()
+	sp.log.Debugf("Adding EndpointSlice for %s", sp.id)
+	for _, port := range sp.ports {
+		port.addEndpointSlice(newSlice)
+	}
+}
+
+func (sp *servicePublisher) updateEndpointSlice(oldSlice *discovery.EndpointSlice, newSlice *discovery.EndpointSlice) {
+	sp.Lock()
+	defer sp.Unlock()
+	sp.log.Debugf("Updating EndpointSlice for %s", sp.id)
+	for _, port := range sp.ports {
+		port.updateEndpointSlice(oldSlice, newSlice)
+	}
+}
+
+func (sp *servicePublisher) deleteEndpointSlice(es *discovery.EndpointSlice) {
+	sp.Lock()
+	defer sp.Unlock()
+	sp.log.Debugf("Deleting EndpointSlice for %s", sp.id)
+	for _, port := range sp.ports {
+		port.deleteEndpointSlice(es)
 	}
 }
 
@@ -301,12 +464,23 @@ func (sp *servicePublisher) updateService(newService *corev1.Service) {
 	defer sp.Unlock()
 	sp.log.Debugf("Updating service for %s", sp.id)
 
+	if sp.enableEndpointSlices {
+		sp.TopologyPref = make([]string, len(newService.Spec.TopologyKeys))
+		copy(sp.TopologyPref, newService.Spec.TopologyKeys)
+	}
+
 	for key, port := range sp.ports {
+		if sp.enableEndpointSlices {
+			port.TopologyPref = sp.TopologyPref
+			port.updateTopologyPreference()
+		}
+
 		newTargetPort := getTargetPort(newService, key.port)
 		if newTargetPort != port.targetPort {
 			port.updatePort(newTargetPort)
 		}
 	}
+
 }
 
 func (sp *servicePublisher) subscribe(srcPort Port, hostname string, listener EndpointUpdateListener) {
@@ -358,21 +532,39 @@ func (sp *servicePublisher) newPortPublisher(srcPort Port, hostname string) *por
 	log := sp.log.WithField("port", srcPort)
 
 	port := &portPublisher{
-		listeners:  []EndpointUpdateListener{},
-		targetPort: targetPort,
-		hostname:   hostname,
-		exists:     exists,
-		k8sAPI:     sp.k8sAPI,
-		log:        log,
-		metrics:    endpointsVecs.newEndpointsMetrics(sp.metricsLabels(srcPort, hostname)),
+		listeners:            []EndpointUpdateListener{},
+		targetPort:           targetPort,
+		srcPort:              srcPort,
+		hostname:             hostname,
+		exists:               exists,
+		k8sAPI:               sp.k8sAPI,
+		log:                  log,
+		metrics:              endpointsVecs.newEndpointsMetrics(sp.metricsLabels(srcPort, hostname)),
+		enableEndpointSlices: sp.enableEndpointSlices,
+		TopologyPref:         sp.TopologyPref,
 	}
 
-	endpoints, err := sp.k8sAPI.Endpoint().Lister().Endpoints(sp.id.Namespace).Get(sp.id.Name)
-	if err != nil && !apierrors.IsNotFound(err) {
-		sp.log.Errorf("error getting endpoints: %s", err)
-	}
-	if err == nil {
-		port.updateEndpoints(endpoints)
+	if port.enableEndpointSlices {
+		matchLabels := map[string]string{discovery.LabelServiceName: sp.id.Name}
+		selector := k8slabels.Set(matchLabels).AsSelector()
+
+		sliceList, err := sp.k8sAPI.ES().Lister().EndpointSlices(sp.id.Namespace).List(selector)
+		if err != nil && !apierrors.IsNotFound(err) {
+			sp.log.Errorf("error getting endpointSlice list: %s", err)
+		}
+		if err == nil {
+			for _, slice := range sliceList {
+				port.addEndpointSlice(slice)
+			}
+		}
+	} else {
+		endpoints, err := sp.k8sAPI.Endpoint().Lister().Endpoints(sp.id.Namespace).Get(sp.id.Name)
+		if err != nil && !apierrors.IsNotFound(err) {
+			sp.log.Errorf("error getting endpoints: %s", err)
+		}
+		if err == nil {
+			port.updateEndpoints(endpoints)
+		}
 	}
 
 	return port
@@ -391,78 +583,288 @@ func (sp *servicePublisher) metricsLabels(port Port, hostname string) prometheus
 // portPublisher.
 
 func (pp *portPublisher) updateEndpoints(endpoints *corev1.Endpoints) {
-	newPods := pp.endpointsToAddresses(endpoints)
-	if len(newPods.Pods) == 0 {
+	newAddressSet := pp.endpointsToAddresses(endpoints)
+	if len(newAddressSet.Addresses) == 0 {
 		for _, listener := range pp.listeners {
 			listener.NoEndpoints(true)
 		}
 	} else {
-		add, remove := diffPods(pp.pods, newPods)
+		add, remove := diffAddresses(pp.addresses, newAddressSet)
 		for _, listener := range pp.listeners {
-			if len(remove.Pods) > 0 {
+			if len(remove.Addresses) > 0 {
 				listener.Remove(remove)
 			}
-			if len(add.Pods) > 0 {
+			if len(add.Addresses) > 0 {
 				listener.Add(add)
 			}
 		}
 	}
+	pp.addresses = newAddressSet
 	pp.exists = true
-	pp.pods = newPods
-
 	pp.metrics.incUpdates()
-	pp.metrics.setPods(len(pp.pods.Pods))
+	pp.metrics.setPods(len(pp.addresses.Addresses))
 	pp.metrics.setExists(true)
 }
 
-func (pp *portPublisher) endpointsToAddresses(endpoints *corev1.Endpoints) PodSet {
-	pods := make(map[PodID]Address)
+func (pp *portPublisher) addEndpointSlice(slice *discovery.EndpointSlice) {
+	newAddressSet := pp.endpointSliceToAddresses(slice)
+	for id, addr := range pp.addresses.Addresses {
+		newAddressSet.Addresses[id] = addr
+	}
+
+	add, _ := diffAddresses(pp.addresses, newAddressSet)
+	if len(add.Addresses) > 0 {
+		for _, listener := range pp.listeners {
+			listener.Add(add)
+		}
+	}
+
+	pp.addresses = newAddressSet
+	pp.exists = true
+	pp.metrics.incUpdates()
+	pp.metrics.setPods(len(pp.addresses.Addresses))
+	pp.metrics.setExists(true)
+}
+
+func (pp *portPublisher) updateEndpointSlice(oldSlice *discovery.EndpointSlice, newSlice *discovery.EndpointSlice) {
+	updatedAddressSet := AddressSet{
+		Addresses:       make(map[ID]Address),
+		Labels:          pp.addresses.Labels,
+		TopologicalPref: pp.TopologyPref,
+	}
+
+	for id, address := range pp.addresses.Addresses {
+		updatedAddressSet.Addresses[id] = address
+	}
+
+	oldAddressSet := pp.endpointSliceToAddresses(oldSlice)
+	for id := range oldAddressSet.Addresses {
+		delete(updatedAddressSet.Addresses, id)
+	}
+
+	newAddressSet := pp.endpointSliceToAddresses(newSlice)
+	for id, address := range newAddressSet.Addresses {
+		updatedAddressSet.Addresses[id] = address
+	}
+
+	add, remove := diffAddresses(pp.addresses, updatedAddressSet)
+	for _, listener := range pp.listeners {
+		if len(remove.Addresses) > 0 {
+			listener.Remove(remove)
+		}
+		if len(add.Addresses) > 0 {
+			listener.Add(add)
+		}
+	}
+
+	pp.addresses = updatedAddressSet
+	pp.exists = true
+	pp.metrics.incUpdates()
+	pp.metrics.setPods(len(pp.addresses.Addresses))
+	pp.metrics.setExists(true)
+}
+
+func metricLabels(resource interface{}) map[string]string {
+	var serviceName, ns string
+	var resLabels, resAnnotations map[string]string
+	switch res := resource.(type) {
+	case *corev1.Endpoints:
+		{
+			serviceName, ns = res.Name, res.Namespace
+			resLabels, resAnnotations = res.Labels, res.Annotations
+		}
+	case *discovery.EndpointSlice:
+		{
+			serviceName, ns = res.Labels[discovery.LabelServiceName], res.Namespace
+			resLabels, resAnnotations = res.Labels, res.Annotations
+		}
+	}
+
+	labels := map[string]string{service: serviceName, namespace: ns}
+
+	remoteClusterName, hasRemoteClusterName := resLabels[consts.RemoteClusterNameLabel]
+	serviceFqn, hasServiceFqn := resAnnotations[consts.RemoteServiceFqName]
+
+	if hasRemoteClusterName && hasServiceFqn {
+		// this means we are looking at Endpoints created for the purpose of mirroring
+		// an out of cluster service.
+		labels[targetCluster] = remoteClusterName
+
+		fqParts := strings.Split(serviceFqn, ".")
+		if len(fqParts) >= 2 {
+			labels[targetService] = fqParts[0]
+			labels[targetServiceNamespace] = fqParts[1]
+		}
+	}
+	return labels
+}
+
+func (pp *portPublisher) endpointSliceToAddresses(es *discovery.EndpointSlice) AddressSet {
+	addressSet := AddressSet{
+		TopologicalPref: pp.TopologyPref,
+		Labels:          metricLabels(es),
+		Addresses:       make(map[ID]Address),
+	}
+
+	resolvedPort := pp.resolveESTargetPort(es.Ports)
+	if resolvedPort == undefinedEndpointPort {
+		return addressSet
+	}
+
+	serviceID, err := getEndpointSliceServiceID(es)
+	if err != nil {
+		pp.log.Errorf("Could not fetch resource service name:%v", err)
+	}
+
+	for _, endpoint := range es.Endpoints {
+		if endpoint.Hostname != nil {
+			if pp.hostname != "" && pp.hostname != *endpoint.Hostname {
+				continue
+			}
+		}
+		if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+			continue
+		}
+
+		if endpoint.TargetRef == nil {
+			for _, IPAddr := range endpoint.Addresses {
+				var authorityOverride string
+				if fqName, ok := es.Annotations[consts.RemoteServiceFqName]; ok {
+					authorityOverride = fmt.Sprintf("%s:%d", fqName, pp.srcPort)
+				}
+
+				identity := es.Annotations[consts.RemoteGatewayIdentity]
+				address, id := pp.newServiceRefAddress(resolvedPort, IPAddr, serviceID.Name, es.Namespace)
+				address.Identity, address.AuthorityOverride = authorityOverride, identity
+
+				for k, v := range endpoint.Topology {
+					address.TopologyLabels[k] = v
+				}
+
+				addressSet.Addresses[id] = address
+			}
+
+			continue
+		}
+
+		if endpoint.TargetRef.Kind == endpointTargetRefPod {
+			for _, IPAddr := range endpoint.Addresses {
+				address, id, err := pp.newPodRefAddress(resolvedPort, IPAddr, endpoint.TargetRef.Name, endpoint.TargetRef.Namespace)
+				if err != nil {
+					pp.log.Errorf("Unable to create new address:%v", err)
+					continue
+				}
+
+				for k, v := range endpoint.Topology {
+					address.TopologyLabels[k] = v
+				}
+
+				addressSet.Addresses[id] = address
+			}
+		}
+
+	}
+
+	return addressSet
+}
+
+func (pp *portPublisher) endpointsToAddresses(endpoints *corev1.Endpoints) AddressSet {
+	addresses := make(map[ID]Address)
 	for _, subset := range endpoints.Subsets {
 		resolvedPort := pp.resolveTargetPort(subset)
+		if resolvedPort == undefinedEndpointPort {
+			continue
+		}
 		for _, endpoint := range subset.Addresses {
 			if pp.hostname != "" && pp.hostname != endpoint.Hostname {
 				continue
 			}
+
 			if endpoint.TargetRef == nil {
-				id := ServiceID{
-					Name: strings.Join([]string{
-						endpoints.ObjectMeta.Name,
-						endpoint.IP,
-						fmt.Sprint(resolvedPort),
-					}, "-"),
-					Namespace: endpoints.ObjectMeta.Namespace,
+				var authorityOverride string
+				if fqName, ok := endpoints.Annotations[consts.RemoteServiceFqName]; ok {
+					authorityOverride = fmt.Sprintf("%s:%d", fqName, pp.srcPort)
 				}
-				pods[id] = Address{
-					IP:   endpoint.IP,
-					Port: resolvedPort,
-				}
+
+				identity := endpoints.Annotations[consts.RemoteGatewayIdentity]
+				address, id := pp.newServiceRefAddress(resolvedPort, endpoint.IP, endpoints.Name, endpoints.Namespace)
+				address.Identity, address.AuthorityOverride = identity, authorityOverride
+
+				addresses[id] = address
 				continue
 			}
-			if endpoint.TargetRef.Kind == "Pod" {
-				id := PodID{
-					Name:      endpoint.TargetRef.Name,
-					Namespace: endpoint.TargetRef.Namespace,
-				}
-				pod, err := pp.k8sAPI.Pod().Lister().Pods(id.Namespace).Get(id.Name)
+
+			if endpoint.TargetRef.Kind == endpointTargetRefPod {
+				address, id, err := pp.newPodRefAddress(resolvedPort, endpoint.IP, endpoint.TargetRef.Name, endpoint.TargetRef.Namespace)
 				if err != nil {
-					pp.log.Errorf("Unable to fetch pod %v: %s", id, err)
+					pp.log.Errorf("Unable to create new address:%v", err)
 					continue
 				}
-				ownerKind, ownerName := pp.k8sAPI.GetOwnerKindAndName(pod, false)
-				pods[id] = Address{
-					IP:        endpoint.IP,
-					Port:      resolvedPort,
-					Pod:       pod,
-					OwnerName: ownerName,
-					OwnerKind: ownerKind,
+				if err != nil {
+					pp.log.Errorf("failed to set opaque port annotation on pod: %s", err)
 				}
+				addresses[id] = address
 			}
 		}
 	}
-	return PodSet{
-		Pods:   pods,
-		Labels: map[string]string{"service": endpoints.Name, "namespace": endpoints.Namespace},
+	return AddressSet{
+		Addresses:       addresses,
+		Labels:          metricLabels(endpoints),
+		TopologicalPref: []string{},
 	}
+}
+
+func (pp *portPublisher) newServiceRefAddress(endpointPort Port, endpointIP, serviceName, serviceNamespace string) (Address, ServiceID) {
+	id := ServiceID{
+		Name: strings.Join([]string{
+			serviceName,
+			endpointIP,
+			fmt.Sprint(endpointPort),
+		}, "-"),
+		Namespace: serviceNamespace,
+	}
+
+	return Address{IP: endpointIP, Port: endpointPort, TopologyLabels: make(map[string]string)}, id
+}
+
+func (pp *portPublisher) newPodRefAddress(endpointPort Port, endpointIP, podName, podNamespace string) (Address, PodID, error) {
+	id := PodID{
+		Name:      podName,
+		Namespace: podNamespace,
+	}
+	pod, err := pp.k8sAPI.Pod().Lister().Pods(id.Namespace).Get(id.Name)
+	if err != nil {
+		return Address{}, PodID{}, fmt.Errorf("unable to fetch pod %v:%v", id, err)
+	}
+	ownerKind, ownerName := pp.k8sAPI.GetOwnerKindAndName(context.Background(), pod, false)
+	addr := Address{
+		IP:             endpointIP,
+		Port:           endpointPort,
+		Pod:            pod,
+		TopologyLabels: make(map[string]string),
+		OwnerName:      ownerName,
+		OwnerKind:      ownerKind,
+	}
+
+	return addr, id, nil
+}
+
+func (pp *portPublisher) resolveESTargetPort(slicePorts []discovery.EndpointPort) Port {
+	if slicePorts == nil {
+		return undefinedEndpointPort
+	}
+
+	switch pp.targetPort.Type {
+	case intstr.Int:
+		return Port(pp.targetPort.IntVal)
+	case intstr.String:
+		for _, p := range slicePorts {
+			if *p.Name == pp.targetPort.StrVal {
+				return Port(*p.Port)
+			}
+		}
+	}
+	return undefinedEndpointPort
 }
 
 func (pp *portPublisher) resolveTargetPort(subset corev1.EndpointSubset) Port {
@@ -476,22 +878,68 @@ func (pp *portPublisher) resolveTargetPort(subset corev1.EndpointSubset) Port {
 			}
 		}
 	}
-	return Port(0)
+	return undefinedEndpointPort
 }
 
 func (pp *portPublisher) updatePort(targetPort namedPort) {
 	pp.targetPort = targetPort
-	endpoints, err := pp.k8sAPI.Endpoint().Lister().Endpoints(pp.id.Namespace).Get(pp.id.Name)
-	if err == nil {
-		pp.updateEndpoints(endpoints)
+
+	if pp.enableEndpointSlices {
+		matchLabels := map[string]string{discovery.LabelServiceName: pp.id.Name}
+		selector := k8slabels.Set(matchLabels).AsSelector()
+
+		endpointSlices, err := pp.k8sAPI.ES().Lister().EndpointSlices(pp.id.Namespace).List(selector)
+		if err == nil {
+			pp.addresses = AddressSet{}
+			for _, slice := range endpointSlices {
+				pp.addEndpointSlice(slice)
+			}
+		} else {
+			pp.log.Errorf("Unable to get EndpointSlices during port update: %s", err)
+		}
 	} else {
-		pp.log.Errorf("Unable to get endpoints during port update: %s", err)
+		endpoints, err := pp.k8sAPI.Endpoint().Lister().Endpoints(pp.id.Namespace).Get(pp.id.Name)
+		if err == nil {
+			pp.updateEndpoints(endpoints)
+		} else {
+			pp.log.Errorf("Unable to get endpoints during port update: %s", err)
+		}
 	}
+}
+
+// updateTopologyPreference is used when a service's topology preference changes. This method
+// propagates the changes to the portPublisher, the portPublisher's AddressSet and triggers
+// an (empty) update for all of its listeners to reflect the new preference changes.
+func (pp *portPublisher) updateTopologyPreference() {
+	pp.addresses.TopologicalPref = pp.TopologyPref
+
+	updatedAddrSet := AddressSet{
+		Addresses:       make(map[ID]Address),
+		Labels:          make(map[string]string),
+		TopologicalPref: pp.TopologyPref,
+	}
+	for _, listener := range pp.listeners {
+		listener.Add(updatedAddrSet)
+	}
+}
+
+func (pp *portPublisher) deleteEndpointSlice(es *discovery.EndpointSlice) {
+	addrSet := pp.endpointSliceToAddresses(es)
+	for id := range addrSet.Addresses {
+		delete(pp.addresses.Addresses, id)
+	}
+
+	for _, listener := range pp.listeners {
+		listener.Remove(addrSet)
+	}
+
+	svcExists := len(pp.addresses.Addresses) > 0
+	pp.noEndpoints(svcExists)
 }
 
 func (pp *portPublisher) noEndpoints(exists bool) {
 	pp.exists = exists
-	pp.pods = PodSet{}
+	pp.addresses = AddressSet{}
 	for _, listener := range pp.listeners {
 		listener.NoEndpoints(exists)
 	}
@@ -503,8 +951,8 @@ func (pp *portPublisher) noEndpoints(exists bool) {
 
 func (pp *portPublisher) subscribe(listener EndpointUpdateListener) {
 	if pp.exists {
-		if len(pp.pods.Pods) > 0 {
-			listener.Add(pp.pods)
+		if len(pp.addresses.Addresses) > 0 {
+			listener.Add(pp.addresses)
 		} else {
 			listener.NoEndpoints(true)
 		}
@@ -534,11 +982,24 @@ func (pp *portPublisher) unsubscribe(listener EndpointUpdateListener) {
 /// util ///
 ////////////
 
+// WithPort sets the port field in all addresses of an address set.
+func (as *AddressSet) WithPort(port Port) AddressSet {
+	wp := AddressSet{
+		Addresses: map[PodID]Address{},
+		Labels:    as.Labels,
+	}
+	for id, addr := range as.Addresses {
+		addr.Port = port
+		wp.Addresses[id] = addr
+	}
+	return wp
+}
+
 // getTargetPort returns the port specified as an argument if no service is
 // present. If the service is present and it has a port spec matching the
-// specified port and a target port configured, it returns the name of the
-// service's port (not the name of the target pod port), so that it can be
-// looked up in the endpoints API response, which uses service port names.
+// specified port, it returns the name of the service's port (not the name
+// of the target pod port), so that it can be looked up in the endpoints API
+// response, which uses service port names.
 func getTargetPort(service *corev1.Service, port Port) namedPort {
 	// Use the specified port as the target port by default
 	targetPort := intstr.FromInt(int(port))
@@ -547,10 +1008,11 @@ func getTargetPort(service *corev1.Service, port Port) namedPort {
 		return targetPort
 	}
 
-	// If a port spec exists with a port matching the specified port and a target
-	// port configured, use that port spec's name as the target port
+	// If a port spec exists with a port matching the specified port use that
+	// port spec's name as the target port
 	for _, portSpec := range service.Spec.Ports {
-		if portSpec.Port == int32(port) && portSpec.TargetPort != intstr.FromInt(0) {
+		if portSpec.Port == int32(port) {
+
 			return intstr.FromString(portSpec.Name)
 		}
 	}
@@ -558,28 +1020,81 @@ func getTargetPort(service *corev1.Service, port Port) namedPort {
 	return targetPort
 }
 
-func diffPods(oldPods, newPods PodSet) (add, remove PodSet) {
+func addressChanged(oldAddress Address, newAddress Address) bool {
+
+	if oldAddress.Identity != newAddress.Identity {
+		// in this case the identity could have changed; this can happen when for
+		// example a mirrored service is reassigned to a new gateway with a different
+		// identity and the service mirroring controller picks that and updates the
+		// identity
+		return true
+	}
+
+	if oldAddress.Pod != nil && newAddress.Pod != nil {
+		// if these addresses are owned by pods we can check the resource versions
+		return oldAddress.Pod.ResourceVersion != newAddress.Pod.ResourceVersion
+	}
+	return false
+}
+
+func diffAddresses(oldAddresses, newAddresses AddressSet) (add, remove AddressSet) {
 	// TODO: this detects pods which have been added or removed, but does not
-	// detect pods which have been modified.  A modified pod should trigger
+	// detect addresses which have been modified.  A modified address should trigger
 	// an add of the new version.
-	addPods := make(map[PodID]Address)
-	removePods := make(map[PodID]Address)
-	for id, pod := range newPods.Pods {
-		if _, ok := oldPods.Pods[id]; !ok {
-			addPods[id] = pod
+	addAddresses := make(map[ID]Address)
+	removeAddresses := make(map[ID]Address)
+	for id, newAddress := range newAddresses.Addresses {
+		if oldAddress, ok := oldAddresses.Addresses[id]; ok {
+			if addressChanged(oldAddress, newAddress) {
+				addAddresses[id] = newAddress
+			}
+		} else {
+			// this is a new address, we need to add it
+			addAddresses[id] = newAddress
 		}
 	}
-	for id, pod := range oldPods.Pods {
-		if _, ok := newPods.Pods[id]; !ok {
-			removePods[id] = pod
+	for id, address := range oldAddresses.Addresses {
+		if _, ok := newAddresses.Addresses[id]; !ok {
+			removeAddresses[id] = address
 		}
 	}
-	add = PodSet{
-		Pods:   addPods,
-		Labels: newPods.Labels,
+	add = AddressSet{
+		Addresses:       addAddresses,
+		Labels:          newAddresses.Labels,
+		TopologicalPref: newAddresses.TopologicalPref,
 	}
-	remove = PodSet{
-		Pods: removePods,
+	remove = AddressSet{
+		Addresses:       removeAddresses,
+		TopologicalPref: newAddresses.TopologicalPref,
 	}
-	return
+	return add, remove
+}
+
+func getEndpointSliceServiceID(es *discovery.EndpointSlice) (ServiceID, error) {
+	if !isValidSlice(es) {
+		return ServiceID{}, fmt.Errorf("EndpointSlice [%s/%s] is invalid", es.Namespace, es.Name)
+	}
+
+	if svc, ok := es.Labels[discovery.LabelServiceName]; ok {
+		return ServiceID{es.Namespace, svc}, nil
+	}
+
+	for _, ref := range es.OwnerReferences {
+		if ref.Kind == "Service" && ref.Name != "" {
+			return ServiceID{es.Namespace, ref.Name}, nil
+		}
+	}
+
+	return ServiceID{}, fmt.Errorf("EndpointSlice [%s/%s] is invalid", es.Namespace, es.Name)
+}
+
+func isValidSlice(es *discovery.EndpointSlice) bool {
+	serviceName, ok := es.Labels[discovery.LabelServiceName]
+	if !ok && len(es.OwnerReferences) == 0 {
+		return false
+	} else if len(es.OwnerReferences) == 0 && serviceName == "" {
+		return false
+	}
+
+	return true
 }

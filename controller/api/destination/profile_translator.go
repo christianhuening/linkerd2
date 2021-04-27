@@ -14,42 +14,31 @@ import (
 
 const millisPerDecimilli = 10
 
-var (
-	defaultRetryBudget = pb.RetryBudget{
-		MinRetriesPerSecond: 10,
-		RetryRatio:          0.2,
-		Ttl: &duration.Duration{
-			Seconds: 10,
-		},
-	}
-
-	defaultServiceProfile = pb.DestinationProfile{
-		Routes:      []*pb.Route{},
-		RetryBudget: &defaultRetryBudget,
-	}
-
-	defaultRouteTimeout = 10 * time.Second
-)
-
 // implements the ProfileUpdateListener interface
 type profileTranslator struct {
-	stream pb.Destination_GetProfileServer
-	log    *logging.Entry
+	stream             pb.Destination_GetProfileServer
+	log                *logging.Entry
+	fullyQualifiedName string
+	port               uint32
+	endpoint           *pb.WeightedAddr
 }
 
-func newProfileTranslator(stream pb.Destination_GetProfileServer, log *logging.Entry) *profileTranslator {
+func newProfileTranslator(stream pb.Destination_GetProfileServer, log *logging.Entry, fqn string, port uint32, endpoint *pb.WeightedAddr) *profileTranslator {
 	return &profileTranslator{
-		stream: stream,
-		log:    log.WithField("component", "profile-translator"),
+		stream:             stream,
+		log:                log.WithField("component", "profile-translator"),
+		fullyQualifiedName: fqn,
+		port:               port,
+		endpoint:           endpoint,
 	}
 }
 
 func (pt *profileTranslator) Update(profile *sp.ServiceProfile) {
 	if profile == nil {
-		pt.stream.Send(&defaultServiceProfile)
+		pt.stream.Send(pt.defaultServiceProfile())
 		return
 	}
-	destinationProfile, err := toServiceProfile(profile)
+	destinationProfile, err := pt.toServiceProfile(profile)
 	if err != nil {
 		pt.log.Error(err)
 		return
@@ -58,7 +47,29 @@ func (pt *profileTranslator) Update(profile *sp.ServiceProfile) {
 	pt.stream.Send(destinationProfile)
 }
 
+func (pt *profileTranslator) defaultServiceProfile() *pb.DestinationProfile {
+	return &pb.DestinationProfile{
+		Routes:             []*pb.Route{},
+		RetryBudget:        defaultRetryBudget(),
+		FullyQualifiedName: pt.fullyQualifiedName,
+		Endpoint:           pt.endpoint,
+	}
+}
+
+func defaultRetryBudget() *pb.RetryBudget {
+	return &pb.RetryBudget{
+		MinRetriesPerSecond: 10,
+		RetryRatio:          0.2,
+		Ttl: &duration.Duration{
+			Seconds: 10,
+		},
+	}
+}
+
 func toDuration(d time.Duration) *duration.Duration {
+	if d == 0 {
+		return nil
+	}
 	return &duration.Duration{
 		Seconds: int64(d / time.Second),
 		Nanos:   int32(d % time.Second),
@@ -67,7 +78,7 @@ func toDuration(d time.Duration) *duration.Duration {
 
 // toServiceProfile returns a Proxy API DestinationProfile, given a
 // ServiceProfile.
-func toServiceProfile(profile *sp.ServiceProfile) (*pb.DestinationProfile, error) {
+func (pt *profileTranslator) toServiceProfile(profile *sp.ServiceProfile) (*pb.DestinationProfile, error) {
 	routes := make([]*pb.Route, 0)
 	for _, route := range profile.Spec.Routes {
 		pbRoute, err := toRoute(profile, route)
@@ -76,7 +87,7 @@ func toServiceProfile(profile *sp.ServiceProfile) (*pb.DestinationProfile, error
 		}
 		routes = append(routes, pbRoute)
 	}
-	budget := defaultRetryBudget
+	budget := defaultRetryBudget()
 	if profile.Spec.RetryBudget != nil {
 		budget.MinRetriesPerSecond = profile.Spec.RetryBudget.MinRetriesPerSecond
 		budget.RetryRatio = profile.Spec.RetryBudget.RetryRatio
@@ -86,10 +97,17 @@ func toServiceProfile(profile *sp.ServiceProfile) (*pb.DestinationProfile, error
 		}
 		budget.Ttl = toDuration(ttl)
 	}
+	var opaqueProtocol bool
+	if profile.Spec.OpaquePorts != nil {
+		_, opaqueProtocol = profile.Spec.OpaquePorts[pt.port]
+	}
 	return &pb.DestinationProfile{
-		Routes:       routes,
-		RetryBudget:  &budget,
-		DstOverrides: toDstOverrides(profile.Spec.DstOverrides),
+		Routes:             routes,
+		RetryBudget:        budget,
+		DstOverrides:       toDstOverrides(profile.Spec.DstOverrides),
+		FullyQualifiedName: pt.fullyQualifiedName,
+		Endpoint:           pt.endpoint,
+		OpaqueProtocol:     opaqueProtocol,
 	}, nil
 }
 
@@ -120,7 +138,7 @@ func toRoute(profile *sp.ServiceProfile, route *sp.RouteSpec) (*pb.Route, error)
 		}
 		rcs = append(rcs, pbRc)
 	}
-	timeout := defaultRouteTimeout
+	var timeout time.Duration // No default timeout
 	if route.Timeout != "" {
 		timeout, err = time.ParseDuration(route.Timeout)
 		if err != nil {
@@ -131,7 +149,6 @@ func toRoute(profile *sp.ServiceProfile, route *sp.RouteSpec) (*pb.Route, error)
 				profile.Namespace,
 				err,
 			)
-			timeout = defaultRouteTimeout
 		}
 	}
 	return &pb.Route{

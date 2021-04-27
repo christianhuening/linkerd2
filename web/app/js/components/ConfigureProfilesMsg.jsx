@@ -13,6 +13,7 @@ import InputLabel from '@material-ui/core/InputLabel';
 import NoteAddIcon from '@material-ui/icons/NoteAdd';
 import PropTypes from 'prop-types';
 import React from 'react';
+import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
 import _isEmpty from 'lodash/isEmpty';
 import { withContext } from './util/AppContext.jsx';
@@ -131,11 +132,10 @@ class ConfigureProfilesMsg extends React.Component {
           color="primary"
           size="small"
           onClick={this.handleClickOpen}>
-          Create Service Profile
+          <Trans>buttonCreateServiceProfile</Trans>
         </Button>
       );
     }
-
 
     const disableDownloadButton = _isEmpty(query.service) || _isEmpty(query.namespace) ||
       error.service || error.namespace;
@@ -144,7 +144,7 @@ class ConfigureProfilesMsg extends React.Component {
         disabled={disableDownloadButton}
         onClick={() => this.handleClose(downloadUrl)}
         color="primary">
-        Download
+        <Trans>buttonDownload</Trans>
       </Button>
     );
 
@@ -155,11 +155,12 @@ class ConfigureProfilesMsg extends React.Component {
           open={open}
           onClose={this.handleClose}
           aria-labelledby="form-dialog-title">
-          <DialogTitle id="form-dialog-title">New service profile</DialogTitle>
+          <DialogTitle id="form-dialog-title">
+            <Trans>New service profile</Trans>
+          </DialogTitle>
           <DialogContent>
             <DialogContentText>
-              To create a service profile, download a profile and then apply it
-              with `kubectl apply`.
+              <Trans>formCreateServiceProfileHelpText</Trans>
             </DialogContentText>
             <FormControl
               className={classes.textField}
@@ -173,8 +174,7 @@ class ConfigureProfilesMsg extends React.Component {
                 aria-describedby="component-error-text" />
               {error.service && (
                 <FormHelperText id="component-error-text">
-                  Service name must consist of lower case alphanumeric characters or &#45;
-                  start with an alphabetic character, and end with an alphanumeric character
+                  <Trans>formServiceNameErrorText</Trans>
                 </FormHelperText>
               )}
             </FormControl>
@@ -190,15 +190,14 @@ class ConfigureProfilesMsg extends React.Component {
                 aria-describedby="component-error-text" />
               {error.namespace && (
                 <FormHelperText id="component-error-text">
-                  Namespace must consist of lower case alphanumeric characters or &#45;
-                  and must start and end with an alphanumeric character
+                  <Trans>formNamespaceErrorText</Trans>
                 </FormHelperText>
               )}
             </FormControl>
           </DialogContent>
           <DialogActions>
             <Button onClick={this.handleClose} color="primary">
-              Cancel
+              <Trans>buttonCancel</Trans>
             </Button>
             {disableDownloadButton ?
               downloadButton :
@@ -221,9 +220,7 @@ class ConfigureProfilesMsg extends React.Component {
       return (
         <CardContent>
           <Typography component="div">
-            No named route traffic found. This could be because the service is
-            not receiving any traffic, or because there is no service profile
-            configured. Does the service have a service profile?
+            <Trans>formNoNamedRouteTrafficFound</Trans>
             {this.renderDownloadProfileForm()}
           </Typography>
         </CardContent>

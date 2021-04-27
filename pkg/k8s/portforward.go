@@ -1,13 +1,13 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"strings"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +25,8 @@ type PortForward struct {
 	method     string
 	url        *url.URL
 	host       string
+	namespace  string
+	podName    string
 	localPort  int
 	remotePort int
 	emitLogs   bool
@@ -33,38 +35,25 @@ type PortForward struct {
 	config     *rest.Config
 }
 
-// NewProxyMetricsForward returns an instance of the PortForward struct that can
-// be used to establish a port-forward connection to a linkerd-proxy's metrics
-// endpoint, specified by namespace and proxyPod.
-func NewProxyMetricsForward(
+// NewContainerMetricsForward returns an instance of the PortForward struct that can
+// be used to establish a port-forward connection to a containers metrics
+// endpoint, specified by namespace, pod, container and portName.
+func NewContainerMetricsForward(
 	k8sAPI *KubernetesAPI,
 	pod corev1.Pod,
+	container corev1.Container,
 	emitLogs bool,
+	portName string,
 ) (*PortForward, error) {
-	if pod.Status.Phase != corev1.PodRunning {
-		return nil, fmt.Errorf("pod not running: %s", pod.GetName())
-	}
-
-	var container corev1.Container
-	for _, c := range pod.Spec.Containers {
-		if c.Name == ProxyContainerName {
-			container = c
-			break
-		}
-	}
-	if container.Name != ProxyContainerName {
-		return nil, fmt.Errorf("no %s container found for pod %s", ProxyContainerName, pod.GetName())
-	}
-
 	var port corev1.ContainerPort
 	for _, p := range container.Ports {
-		if p.Name == ProxyAdminPortName {
+		if p.Name == portName {
 			port = p
 			break
 		}
 	}
-	if port.Name != ProxyAdminPortName {
-		return nil, fmt.Errorf("no %s port found for container %s/%s", ProxyAdminPortName, pod.GetName(), container.Name)
+	if port.Name != portName {
+		return nil, fmt.Errorf("no %s port found for container %s/%s", portName, pod.GetName(), container.Name)
 	}
 
 	return newPortForward(k8sAPI, pod.GetNamespace(), pod.GetName(), "localhost", 0, int(port.ContainerPort), emitLogs)
@@ -78,13 +67,14 @@ func NewProxyMetricsForward(
 // function is typically called by the CLI. Care should be taken if called from
 // control plane code.
 func NewPortForward(
+	ctx context.Context,
 	k8sAPI *KubernetesAPI,
 	namespace, deployName string,
 	host string, localPort, remotePort int,
 	emitLogs bool,
 ) (*PortForward, error) {
 	timeoutSeconds := int64(30)
-	podList, err := k8sAPI.CoreV1().Pods(namespace).List(metav1.ListOptions{TimeoutSeconds: &timeoutSeconds})
+	podList, err := k8sAPI.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{TimeoutSeconds: &timeoutSeconds})
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +82,12 @@ func NewPortForward(
 	podName := ""
 	for _, pod := range podList.Items {
 		if pod.Status.Phase == corev1.PodRunning {
-			if strings.HasPrefix(pod.Name, deployName) {
+			grandparent, err := getDeploymentForPod(ctx, k8sAPI, pod)
+			if err != nil {
+				log.Warnf("Failed to get deploy for pod [%s]: %s", pod.Name, err)
+				continue
+			}
+			if grandparent == deployName {
 				podName = pod.Name
 				break
 			}
@@ -104,6 +99,22 @@ func NewPortForward(
 	}
 
 	return newPortForward(k8sAPI, namespace, podName, host, localPort, remotePort, emitLogs)
+}
+
+func getDeploymentForPod(ctx context.Context, k8sAPI *KubernetesAPI, pod corev1.Pod) (string, error) {
+	parents := pod.GetOwnerReferences()
+	if len(parents) != 1 {
+		return "", nil
+	}
+	rs, err := k8sAPI.AppsV1().ReplicaSets(pod.Namespace).Get(ctx, parents[0].Name, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	grandparents := rs.GetOwnerReferences()
+	if len(grandparents) != 1 {
+		return "", nil
+	}
+	return grandparents[0].Name, nil
 }
 
 func newPortForward(
@@ -131,6 +142,8 @@ func newPortForward(
 		method:     "POST",
 		url:        req.URL(),
 		host:       host,
+		namespace:  namespace,
+		podName:    podName,
 		localPort:  localPort,
 		remotePort: remotePort,
 		emitLogs:   emitLogs,
@@ -163,7 +176,12 @@ func (pf *PortForward) run() error {
 		return err
 	}
 
-	return fw.ForwardPorts()
+	err = fw.ForwardPorts()
+	if err != nil {
+		err = fmt.Errorf("%s for %s/%s", err, pf.namespace, pf.podName)
+		return err
+	}
+	return nil
 }
 
 // Init creates and runs a port-forward connection.
@@ -177,14 +195,6 @@ func (pf *PortForward) Init() error {
 	go func() {
 		if err := pf.run(); err != nil {
 			failure <- err
-		}
-
-		select {
-		case <-pf.GetStop():
-			// stopCh was closed, do nothing
-		default:
-			// pf.run() returned for some other reason, close stopCh
-			pf.Stop()
 		}
 	}()
 
@@ -203,6 +213,7 @@ func (pf *PortForward) Init() error {
 }
 
 // Stop terminates the port-forward connection.
+// It is the caller's responsibility to call Stop even in case of errors
 func (pf *PortForward) Stop() {
 	close(pf.stopCh)
 }
@@ -216,6 +227,11 @@ func (pf *PortForward) GetStop() <-chan struct{} {
 // URLFor returns the URL for the port-forward connection.
 func (pf *PortForward) URLFor(path string) string {
 	return fmt.Sprintf("http://%s:%d%s", pf.host, pf.localPort, path)
+}
+
+// AddressAndPort returns the address and port for the port-forward connection.
+func (pf *PortForward) AddressAndPort() string {
+	return fmt.Sprintf("%s:%d", pf.host, pf.localPort)
 }
 
 // getEphemeralPort selects a port for the port-forwarding. It binds to a free

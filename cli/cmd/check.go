@@ -1,21 +1,29 @@
 package cmd
 
 import (
-	"encoding/json"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/linkerd/linkerd2/pkg/version"
-
 	"github.com/briandowns/spinner"
+	"github.com/linkerd/linkerd2/cli/flag"
+	jaegerCmd "github.com/linkerd/linkerd2/jaeger/cmd"
+	mcCmd "github.com/linkerd/linkerd2/multicluster/cmd"
+	charts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
+	"github.com/linkerd/linkerd2/pkg/k8s"
+	"github.com/linkerd/linkerd2/pkg/version"
+	vizHealthCheck "github.com/linkerd/linkerd2/viz/pkg/healthcheck"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	valuespkg "helm.sh/helm/v3/pkg/cli/values"
 )
 
 type checkOptions struct {
@@ -95,7 +103,7 @@ code.`,
 		Example: `  # Check that the Linkerd cluster-wide resource are installed correctly
   linkerd check config`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return configureAndRunChecks(stdout, stderr, configStage, options)
+			return configureAndRunChecks(cmd, stdout, stderr, configStage, options)
 		},
 	}
 
@@ -129,7 +137,7 @@ non-zero exit code.`,
   # Check that the Linkerd data plane proxies in the "app" namespace are up and running
   linkerd check --proxy --namespace app`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return configureAndRunChecks(stdout, stderr, "", options)
+			return configureAndRunChecks(cmd, stdout, stderr, "", options)
 		},
 	}
 
@@ -141,7 +149,7 @@ non-zero exit code.`,
 	return cmd
 }
 
-func configureAndRunChecks(wout io.Writer, werr io.Writer, stage string, options *checkOptions) error {
+func configureAndRunChecks(cmd *cobra.Command, wout io.Writer, werr io.Writer, stage string, options *checkOptions) error {
 	err := options.validate()
 	if err != nil {
 		return fmt.Errorf("Validation error when executing check command: %v", err)
@@ -165,7 +173,7 @@ func configureAndRunChecks(wout io.Writer, werr io.Writer, stage string, options
 		} else {
 			checks = append(checks, healthcheck.LinkerdPreInstallCapabilityChecks)
 		}
-		installManifest, err = renderInstallManifest()
+		installManifest, err = renderInstallManifest(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("Error rendering install manifest: %v", err)
 		}
@@ -174,8 +182,9 @@ func configureAndRunChecks(wout io.Writer, werr io.Writer, stage string, options
 
 		if stage != configStage {
 			checks = append(checks, healthcheck.LinkerdControlPlaneExistenceChecks)
-			checks = append(checks, healthcheck.LinkerdAPIChecks)
 			checks = append(checks, healthcheck.LinkerdIdentity)
+			checks = append(checks, healthcheck.LinkerdWebhooksAndAPISvcTLS)
+			checks = append(checks, healthcheck.LinkerdControlPlaneProxyChecks)
 
 			if options.dataPlaneOnly {
 				checks = append(checks, healthcheck.LinkerdDataPlaneChecks)
@@ -185,6 +194,7 @@ func configureAndRunChecks(wout io.Writer, werr io.Writer, stage string, options
 			}
 			checks = append(checks, healthcheck.LinkerdCNIPluginChecks)
 			checks = append(checks, healthcheck.LinkerdHAChecks)
+
 		}
 	}
 
@@ -203,171 +213,152 @@ func configureAndRunChecks(wout io.Writer, werr io.Writer, stage string, options
 		InstallManifest:       installManifest,
 	})
 
-	success := runChecks(wout, werr, hc, options.output)
+	success := healthcheck.RunChecks(wout, werr, hc, options.output)
 
-	if !success {
-		os.Exit(2)
+	extensionSuccess, err := runExtensionChecks(cmd, wout, werr, options)
+	if err != nil {
+		err = fmt.Errorf("failed to run extensions checks: %s", err)
+		fmt.Fprintln(werr, err)
+		os.Exit(1)
+	}
+
+	if !success || !extensionSuccess {
+		os.Exit(1)
 	}
 
 	return nil
 }
 
-func runChecks(wout io.Writer, werr io.Writer, hc *healthcheck.HealthChecker, output string) bool {
-	if output == jsonOutput {
-		return runChecksJSON(wout, werr, hc)
+func runExtensionChecks(cmd *cobra.Command, wout io.Writer, werr io.Writer, opts *checkOptions) (bool, error) {
+	kubeAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+	if err != nil {
+		return false, err
 	}
-	return runChecksTable(wout, hc)
-}
 
-func runChecksTable(wout io.Writer, hc *healthcheck.HealthChecker) bool {
-	var lastCategory healthcheck.CategoryID
+	namespaces, err := kubeAPI.GetAllNamespacesWithExtensionLabel(cmd.Context())
+	if err != nil {
+		return false, err
+	}
+
+	success := true
+	// no extensions to check
+	if len(namespaces) == 0 {
+		return success, nil
+	}
+
+	if opts.output != healthcheck.JSONOutput {
+		headerTxt := "Linkerd extensions checks"
+		fmt.Fprintln(wout)
+		fmt.Fprintln(wout, headerTxt)
+		fmt.Fprintln(wout, strings.Repeat("=", len(headerTxt)))
+	}
+
 	spin := spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 	spin.Writer = wout
 
-	prettyPrintResults := func(result *healthcheck.CheckResult) {
-		if lastCategory != result.Category {
-			if lastCategory != "" {
-				fmt.Fprintln(wout)
-			}
-
-			fmt.Fprintln(wout, result.Category)
-			fmt.Fprintln(wout, strings.Repeat("-", len(result.Category)))
-
-			lastCategory = result.Category
+	for i, ns := range namespaces {
+		if opts.output != healthcheck.JSONOutput && i < len(namespaces) {
+			// add a new line to space out each check output
+			fmt.Fprintln(wout)
 		}
+		extension := ns.Labels[k8s.LinkerdExtensionLabel]
 
-		spin.Stop()
-		if result.Retry {
+		var path string
+		args := append([]string{"check"}, getExtensionCheckFlags(cmd.Flags())...)
+		var err error
+		results := healthcheck.CheckResults{
+			Results: []healthcheck.CheckResult{},
+		}
+		extensionCmd := fmt.Sprintf("linkerd-%s", extension)
+
+		switch extension {
+		case jaegerCmd.JaegerExtensionName:
+			path = os.Args[0]
+			args = append([]string{"jaeger"}, args...)
+		case vizHealthCheck.VizExtensionName:
+			path = os.Args[0]
+			args = append([]string{"viz"}, args...)
+		case mcCmd.MulticlusterExtensionName:
+			path = os.Args[0]
+			args = append([]string{"multicluster"}, args...)
+		default:
+			path, err = exec.LookPath(extensionCmd)
+			results.Results = []healthcheck.CheckResult{
+				{
+					Category:    healthcheck.CategoryID(extensionCmd),
+					Description: fmt.Sprintf("Linkerd extension command %s exists", extensionCmd),
+					Err:         err,
+					HintURL:     healthcheck.DefaultHintBaseURL + "extensions",
+					Warning:     true,
+				},
+			}
+		}
+		if err == nil {
 			if isatty.IsTerminal(os.Stdout.Fd()) {
-				spin.Suffix = fmt.Sprintf(" %s", result.Err)
+				spin.Suffix = fmt.Sprintf(" Running %s extension check", extension)
 				spin.Color("bold") // this calls spin.Restart()
 			}
-			return
-		}
-
-		status := okStatus
-		if result.Err != nil {
-			status = failStatus
-			if result.Warning {
-				status = warnStatus
-			}
-		}
-
-		fmt.Fprintf(wout, "%s %s\n", status, result.Description)
-		if result.Err != nil {
-			fmt.Fprintf(wout, "    %s\n", result.Err)
-			if result.HintAnchor != "" {
-				fmt.Fprintf(wout, "    see %s%s for hints\n", healthcheck.HintBaseURL, result.HintAnchor)
-			}
-		}
-	}
-
-	success := hc.RunChecks(prettyPrintResults)
-	// this empty line separates final results from the checks list in the output
-	fmt.Fprintln(wout, "")
-
-	if !success {
-		fmt.Fprintf(wout, "Status check results are %s\n", failStatus)
-	} else {
-		fmt.Fprintf(wout, "Status check results are %s\n", okStatus)
-	}
-
-	return success
-}
-
-type checkOutput struct {
-	Success    bool             `json:"success"`
-	Categories []*checkCategory `json:"categories"`
-}
-
-type checkCategory struct {
-	Name   string   `json:"categoryName"`
-	Checks []*check `json:"checks"`
-}
-
-// check is a user-facing version of `healthcheck.CheckResult`, for output via
-// `linkerd check -o json`.
-type check struct {
-	Description string      `json:"description"`
-	Hint        string      `json:"hint,omitempty"`
-	Error       string      `json:"error,omitempty"`
-	Result      checkResult `json:"result"`
-}
-
-type checkResult string
-
-const (
-	checkSuccess checkResult = "success"
-	checkWarn    checkResult = "warning"
-	checkErr     checkResult = "error"
-)
-
-func runChecksJSON(wout io.Writer, werr io.Writer, hc *healthcheck.HealthChecker) bool {
-	var categories []*checkCategory
-
-	collectJSONOutput := func(result *healthcheck.CheckResult) {
-		categoryName := string(result.Category)
-		if categories == nil || categories[len(categories)-1].Name != categoryName {
-			categories = append(categories, &checkCategory{
-				Name:   categoryName,
-				Checks: []*check{},
-			})
-		}
-
-		if !result.Retry {
-			currentCategory := categories[len(categories)-1]
-			// ignore checks that are going to be retried, we want only final results
-			status := checkSuccess
-			if result.Err != nil {
-				status = checkErr
-				if result.Warning {
-					status = checkWarn
+			plugin := exec.Command(path, args...)
+			var stdout, stderr bytes.Buffer
+			plugin.Stdout = &stdout
+			plugin.Stderr = &stderr
+			plugin.Run()
+			extensionResults, err := healthcheck.ParseJSONCheckOutput(stdout.Bytes())
+			spin.Stop()
+			if err != nil {
+				command := fmt.Sprintf("%s %s", path, strings.Join(args, " "))
+				if len(stderr.String()) > 0 {
+					err = errors.New(stderr.String())
+				} else {
+					err = fmt.Errorf("invalid extension check output from \"%s\" (JSON object expected):\n%s\n[%s]", command, stdout.String(), err)
 				}
+				results.Results = append(results.Results, healthcheck.CheckResult{
+					Category:    healthcheck.CategoryID(extensionCmd),
+					Description: fmt.Sprintf("Running: %s", command),
+					Err:         err,
+					HintURL:     healthcheck.DefaultHintBaseURL + "extensions",
+				})
+				success = false
+			} else {
+				results.Results = append(results.Results, extensionResults.Results...)
 			}
-
-			currentCheck := &check{
-				Description: result.Description,
-				Result:      status,
-			}
-
-			if result.Err != nil {
-				currentCheck.Error = result.Err.Error()
-
-				if result.HintAnchor != "" {
-					currentCheck.Hint = fmt.Sprintf("%s%s", healthcheck.HintBaseURL, result.HintAnchor)
-				}
-			}
-			currentCategory.Checks = append(currentCategory.Checks, currentCheck)
+		}
+		extensionSuccess := healthcheck.RunChecks(wout, werr, results, opts.output)
+		if !extensionSuccess {
+			success = false
 		}
 	}
-
-	result := hc.RunChecks(collectJSONOutput)
-
-	outputJSON := checkOutput{
-		Success:    result,
-		Categories: categories,
-	}
-
-	resultJSON, err := json.MarshalIndent(outputJSON, "", "  ")
-	if err == nil {
-		fmt.Fprintf(wout, "%s\n", string(resultJSON))
-	} else {
-		fmt.Fprintf(werr, "JSON serialization of the check result failed with %s", err)
-	}
-	return result
+	return success, nil
 }
 
-func renderInstallManifest() (string, error) {
-	options, err := newInstallOptionsWithDefaults()
+func getExtensionCheckFlags(lf *pflag.FlagSet) []string {
+	extensionFlags := []string{
+		"api-addr", "context", "as", "as-group", "kubeconfig", "linkerd-namespace", "verbose",
+		"namespace", "proxy", "wait",
+	}
+	cmdLineFlags := []string{}
+	for _, flag := range extensionFlags {
+		f := lf.Lookup(flag)
+		if f != nil {
+			val := f.Value.String()
+			if val != "" {
+				cmdLineFlags = append(cmdLineFlags, fmt.Sprintf("--%s=%s", f.Name, val))
+			}
+		}
+	}
+	cmdLineFlags = append(cmdLineFlags, "--output=json")
+	return cmdLineFlags
+}
+
+func renderInstallManifest(ctx context.Context) (string, error) {
+	values, err := charts.NewValues()
 	if err != nil {
 		return "", err
 	}
-	values, _, err := options.validateAndBuild("", nil)
-	if err != nil {
-		return "", err
-	}
+
 	var b strings.Builder
-	if err := render(&b, values); err != nil {
+	err = install(ctx, &b, values, []flag.Flag{}, "", valuespkg.Options{})
+	if err != nil {
 		return "", err
 	}
 	return b.String(), nil

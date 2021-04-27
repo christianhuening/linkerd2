@@ -15,12 +15,13 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
 	"github.com/julienschmidt/httprouter"
-	"github.com/linkerd/linkerd2/controller/api/util"
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/protohttp"
-	"github.com/linkerd/linkerd2/pkg/tap"
+	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
+	vizUtil "github.com/linkerd/linkerd2/viz/metrics-api/util"
+	tapPb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
+	tappkg "github.com/linkerd/linkerd2/viz/tap/pkg"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
@@ -83,22 +84,16 @@ func renderJSONBytes(w http.ResponseWriter, b []byte) {
 }
 
 func (h *handler) handleAPIVersion(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-	version, err := h.apiClient.Version(req.Context(), &pb.Empty{})
-
-	if err != nil {
-		renderJSONError(w, err, http.StatusInternalServerError)
-		return
-	}
 	resp := map[string]interface{}{
-		"version": version,
+		"version": h.version,
 	}
 	renderJSON(w, resp)
 }
 
 func (h *handler) handleAPIPods(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-	pods, err := h.apiClient.ListPods(req.Context(), &pb.ListPodsRequest{
-		Selector: &pb.ResourceSelection{
-			Resource: &pb.Resource{
+	pods, err := h.apiClient.ListPods(req.Context(), &metricsPb.ListPodsRequest{
+		Selector: &metricsPb.ResourceSelection{
+			Resource: &metricsPb.Resource{
 				Namespace: req.FormValue("namespace"),
 			},
 		},
@@ -113,7 +108,7 @@ func (h *handler) handleAPIPods(w http.ResponseWriter, req *http.Request, p http
 }
 
 func (h *handler) handleAPIServices(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-	services, err := h.apiClient.ListServices(req.Context(), &pb.ListServicesRequest{
+	services, err := h.apiClient.ListServices(req.Context(), &metricsPb.ListServicesRequest{
 		Namespace: req.FormValue("namespace"),
 	})
 
@@ -136,8 +131,8 @@ func (h *handler) handleAPIStat(w http.ResponseWriter, req *http.Request, p http
 
 	trueStr := fmt.Sprintf("%t", true)
 
-	requestParams := util.StatsSummaryRequestParams{
-		StatsBaseRequestParams: util.StatsBaseRequestParams{
+	requestParams := vizUtil.StatsSummaryRequestParams{
+		StatsBaseRequestParams: vizUtil.StatsBaseRequestParams{
 			TimeWindow:    req.FormValue("window"),
 			ResourceName:  req.FormValue("resource_name"),
 			ResourceType:  req.FormValue("resource_type"),
@@ -159,7 +154,7 @@ func (h *handler) handleAPIStat(w http.ResponseWriter, req *http.Request, p http
 		requestParams.ResourceType = defaultResourceType
 	}
 
-	statRequest, err := util.BuildStatSummaryRequest(requestParams)
+	statRequest, err := vizUtil.BuildStatSummaryRequest(requestParams)
 	if err != nil {
 		renderJSONError(w, err, http.StatusInternalServerError)
 		return
@@ -183,8 +178,8 @@ func (h *handler) handleAPIStat(w http.ResponseWriter, req *http.Request, p http
 }
 
 func (h *handler) handleAPITopRoutes(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-	requestParams := util.TopRoutesRequestParams{
-		StatsBaseRequestParams: util.StatsBaseRequestParams{
+	requestParams := vizUtil.TopRoutesRequestParams{
+		StatsBaseRequestParams: vizUtil.StatsBaseRequestParams{
 			TimeWindow:   req.FormValue("window"),
 			ResourceName: req.FormValue("resource_name"),
 			ResourceType: req.FormValue("resource_type"),
@@ -195,7 +190,7 @@ func (h *handler) handleAPITopRoutes(w http.ResponseWriter, req *http.Request, p
 		ToNamespace: req.FormValue("to_namespace"),
 	}
 
-	topReq, err := util.BuildTopRoutesRequest(requestParams)
+	topReq, err := vizUtil.BuildTopRoutesRequest(requestParams)
 	if err != nil {
 		renderJSONError(w, err, http.StatusBadRequest)
 		return
@@ -255,27 +250,27 @@ func (h *handler) handleAPITap(w http.ResponseWriter, req *http.Request, p httpr
 		return
 	}
 
-	var requestParams util.TapRequestParams
+	var requestParams tappkg.TapRequestParams
 	err = json.Unmarshal(message, &requestParams)
 	if err != nil {
 		websocketError(ws, websocket.CloseInternalServerErr, err)
 		return
 	}
 
-	tapReq, err := util.BuildTapByResourceRequest(requestParams)
+	tapReq, err := tappkg.BuildTapByResourceRequest(requestParams)
 	if err != nil {
 		websocketError(ws, websocket.CloseInternalServerErr, err)
 		return
 	}
 
 	go func() {
-		reader, body, err := tap.Reader(h.k8sAPI, tapReq, 0)
+		reader, body, err := tappkg.Reader(req.Context(), h.k8sAPI, tapReq)
 		if err != nil {
 			// If there was a [403] error when initiating a tap, close the
 			// socket with `ClosePolicyViolation` status code so that the error
 			// renders without the error prefix in the banner
 			if httpErr, ok := err.(protohttp.HTTPError); ok && httpErr.Code == http.StatusForbidden {
-				err := fmt.Errorf("missing authorization, visit %s to remedy", tap.TapRbacURL)
+				err := fmt.Errorf("missing authorization, visit %s to remedy", tappkg.TapRbacURL)
 				websocketError(ws, websocket.ClosePolicyViolation, err)
 				return
 			}
@@ -288,7 +283,7 @@ func (h *handler) handleAPITap(w http.ResponseWriter, req *http.Request, p httpr
 		defer body.Close()
 
 		for {
-			event := pb.TapEvent{}
+			event := tapPb.TapEvent{}
 			err := protohttp.FromByteStreamToProtocolBuffers(reader, &event)
 			if err == io.EOF {
 				break
@@ -327,12 +322,12 @@ func (h *handler) handleAPITap(w http.ResponseWriter, req *http.Request, p httpr
 }
 
 func (h *handler) handleAPIEdges(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
-	requestParams := util.EdgesRequestParams{
+	requestParams := vizUtil.EdgesRequestParams{
 		Namespace:    req.FormValue("namespace"),
 		ResourceType: req.FormValue("resource_type"),
 	}
 
-	edgesRequest, err := util.BuildEdgesRequest(requestParams)
+	edgesRequest, err := vizUtil.BuildEdgesRequest(requestParams)
 	if err != nil {
 		renderJSONError(w, err, http.StatusInternalServerError)
 		return
@@ -366,7 +361,7 @@ func (h *handler) handleAPICheck(w http.ResponseWriter, req *http.Request, p htt
 				success = false
 			}
 			errMsg = result.Err.Error()
-			hintURL = fmt.Sprintf("%s%s", healthcheck.HintBaseURL, result.HintAnchor)
+			hintURL = result.HintURL
 		}
 		results[result.Category] = append(results[result.Category], &CheckResult{
 			CheckResult: result,
@@ -406,21 +401,21 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 	options := metav1.GetOptions{}
 	switch resourceType {
 	case k8s.CronJob:
-		resource, err = h.k8sAPI.BatchV1beta1().CronJobs(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.BatchV1beta1().CronJobs(namespace).Get(req.Context(), resourceName, options)
 	case k8s.DaemonSet:
-		resource, err = h.k8sAPI.AppsV1().DaemonSets(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.AppsV1().DaemonSets(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Deployment:
-		resource, err = h.k8sAPI.AppsV1().Deployments(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.AppsV1().Deployments(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Job:
-		resource, err = h.k8sAPI.BatchV1().Jobs(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.BatchV1().Jobs(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Pod:
-		resource, err = h.k8sAPI.CoreV1().Pods(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.CoreV1().Pods(namespace).Get(req.Context(), resourceName, options)
 	case k8s.ReplicationController:
-		resource, err = h.k8sAPI.CoreV1().ReplicationControllers(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.CoreV1().ReplicationControllers(namespace).Get(req.Context(), resourceName, options)
 	case k8s.ReplicaSet:
-		resource, err = h.k8sAPI.AppsV1().ReplicaSets(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.AppsV1().ReplicaSets(namespace).Get(req.Context(), resourceName, options)
 	case k8s.TrafficSplit:
-		resource, err = h.k8sAPI.TsClient.SplitV1alpha1().TrafficSplits(namespace).Get(resourceName, options)
+		resource, err = h.k8sAPI.TsClient.SplitV1alpha1().TrafficSplits(namespace).Get(req.Context(), resourceName, options)
 	default:
 		renderJSONError(w, errors.New("Invalid resource type: "+resourceType), http.StatusBadRequest)
 		return
@@ -437,4 +432,47 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 	}
 	w.Header().Set("Content-Type", "text/yaml")
 	w.Write(resourceDefinition)
+}
+
+func (h *handler) handleGetExtension(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+	ctx := req.Context()
+	extensionName := req.FormValue("extension_name")
+
+	resp := map[string]interface{}{}
+	ns, err := h.k8sAPI.GetNamespaceWithExtensionLabel(ctx, extensionName)
+	if err != nil && strings.HasPrefix(err.Error(), "could not find") {
+		renderJSON(w, resp)
+		return
+	} else if err != nil {
+		renderJSONError(w, err, http.StatusInternalServerError)
+		return
+	}
+
+	resp["extensionName"] = ns.GetLabels()[k8s.LinkerdExtensionLabel]
+	resp["namespace"] = ns.Name
+
+	renderJSON(w, resp)
+}
+
+func (h *handler) handleAPIGateways(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+	window := req.FormValue("window")
+	if window == "" {
+		window = "1m"
+	}
+	_, err := time.ParseDuration(window)
+	if err != nil {
+		renderJSONError(w, err, http.StatusInternalServerError)
+		return
+	}
+	gatewayRequest := &metricsPb.GatewaysRequest{
+		TimeWindow:        window,
+		GatewayNamespace:  req.FormValue("gatewayNamespace"),
+		RemoteClusterName: req.FormValue("remoteClusterName"),
+	}
+	result, err := h.apiClient.Gateways(req.Context(), gatewayRequest)
+	if err != nil {
+		renderJSONError(w, err, http.StatusInternalServerError)
+		return
+	}
+	renderJSONPb(w, result)
 }

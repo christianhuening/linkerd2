@@ -1,3 +1,4 @@
+import { Plural, Trans } from '@lingui/macro';
 import PropTypes from 'prop-types';
 import React from 'react';
 import Step from '@material-ui/core/Step';
@@ -9,12 +10,6 @@ import { incompleteMeshMessage } from './util/CopyUtils.jsx';
 import { withStyles } from '@material-ui/core/styles';
 
 const styles = theme => ({
-  root: {
-    width: '90%',
-  },
-  button: {
-    marginRight: theme.spacing(1),
-  },
   instructions: {
     marginTop: theme.spacing(1),
     marginBottom: theme.spacing(1),
@@ -23,21 +18,22 @@ const styles = theme => ({
 
 function getSteps(numResources, resource) {
   return [
-    { label: 'Controller successfully installed' },
-    { label: `${numResources || 'No'} ${resource}s detected` },
-    { label: `Connect your first ${resource}`, content: incompleteMeshMessage() },
+    { label: <Trans>controllerInstalledMsg</Trans>, key: 'installedMsg' },
+    { label: <Plural value={numResources} zero={resource} one={resource} other={resource} />, key: 'resourceMsg' },
+    { label: <Trans>connectResourceMsg {resource}</Trans>, content: incompleteMeshMessage(), key: 'connectMsg' },
   ];
 }
 
-const CallToAction = ({ resource, numResources }) => {
+const CallToAction = ({ resource, numResources, classes }) => {
   const steps = getSteps(numResources, resource);
   const lastStep = steps.length - 1; // hardcode the last step as the active step
 
   return (
     <React.Fragment>
-      <Typography>The service mesh was successfully installed!</Typography>
+      <Typography><Trans>serviceMeshInstalledMsg</Trans></Typography>
       <Stepper
         activeStep={lastStep}
+        className={classes.instructions}
         orientation="vertical">
         {
           steps.map((step, i) => {
@@ -45,7 +41,7 @@ const CallToAction = ({ resource, numResources }) => {
             props.completed = i < lastStep; // select the last step as the currently active one
 
             return (
-              <Step key={step.label} {...props}>
+              <Step key={step.key} {...props}>
                 <StepLabel>{step.label}</StepLabel>
                 <StepContent>{step.content}</StepContent>
               </Step>

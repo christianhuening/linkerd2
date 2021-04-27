@@ -7,10 +7,9 @@ import (
 	"regexp"
 
 	"github.com/julienschmidt/httprouter"
-	"github.com/linkerd/linkerd2/controller/api/public"
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	profiles "github.com/linkerd/linkerd2/pkg/profiles"
+	vizPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 )
@@ -22,12 +21,16 @@ type (
 
 	handler struct {
 		render              renderTemplate
-		apiClient           public.APIClient
+		apiClient           vizPb.ApiClient
 		k8sAPI              *k8s.KubernetesAPI
 		uuid                string
+		version             string
 		controllerNamespace string
 		clusterDomain       string
-		grafanaProxy        *grafanaProxy
+		grafana             string
+		jaeger              string
+		grafanaProxy        *reverseProxy
+		jaegerProxy         *reverseProxy
 		hc                  healthChecker
 		statCache           *cache.Cache
 	}
@@ -42,21 +45,14 @@ func (h *handler) handleIndex(w http.ResponseWriter, req *http.Request, p httpro
 
 	params := appParams{
 		UUID:                h.uuid,
+		ReleaseVersion:      h.version,
 		ControllerNamespace: h.controllerNamespace,
 		PathPrefix:          pathPfx,
+		Grafana:             h.grafana,
+		Jaeger:              h.jaeger,
 	}
 
-	version, err := h.apiClient.Version(req.Context(), &pb.Empty{}) // TODO: remove and call /api/version from web app
-	if err != nil {
-		params.Error = true
-		params.ErrorMessage = err.Error()
-		log.Error(err)
-	} else {
-		params.Data = *version
-	}
-
-	err = h.render(w, "app.tmpl.html", "base", params)
-
+	err := h.render(w, "app.tmpl.html", "base", params)
 	if err != nil {
 		log.Error(err)
 	}
@@ -92,4 +88,8 @@ func (h *handler) handleProfileDownload(w http.ResponseWriter, req *http.Request
 
 func (h *handler) handleGrafana(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
 	h.grafanaProxy.ServeHTTP(w, req)
+}
+
+func (h *handler) handleJaeger(w http.ResponseWriter, req *http.Request, p httprouter.Params) {
+	h.jaegerProxy.ServeHTTP(w, req)
 }

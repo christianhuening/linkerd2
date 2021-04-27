@@ -1,4 +1,5 @@
-import { distanceInWordsToNow, subSeconds } from 'date-fns';
+import { Plural, Trans } from '@lingui/macro';
+import { formatDistanceToNow, subSeconds } from 'date-fns';
 import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
 import BaseTable from './BaseTable.jsx';
 import CallToAction from './CallToAction.jsx';
@@ -35,11 +36,11 @@ const styles = {
 
 const serviceMeshDetailsColumns = [
   {
-    title: 'Name',
+    title: <Trans>columnTitleName</Trans>,
     dataIndex: 'name',
   },
   {
-    title: 'Value',
+    title: <Trans>columnTitleValue</Trans>,
     dataIndex: 'value',
     isNumeric: true,
   },
@@ -56,14 +57,9 @@ const getPodClassification = pod => {
 };
 
 const componentsToDeployNames = {
-  Destination: 'linkerd-controller',
-  Grafana: 'linkerd-grafana',
+  Destination: 'linkerd-destination',
   Identity: 'linkerd-identity',
-  Prometheus: 'linkerd-prometheus',
-  'Public API': 'linkerd-controller',
-  'Service Profile Validator': 'linkerd-sp-validator',
-  Tap: 'linkerd-tap',
-  'Web UI': 'linkerd-web',
+  'Proxy Injector': 'linkerd-proxy-injector',
 };
 
 class ServiceMesh extends React.Component {
@@ -106,10 +102,10 @@ class ServiceMesh extends React.Component {
     const { productName, releaseVersion, controllerNamespace } = this.props;
 
     return [
-      { key: 1, name: `${productName} version`, value: releaseVersion },
-      { key: 2, name: `${productName} namespace`, value: controllerNamespace },
-      { key: 3, name: 'Control plane components', value: components.length },
-      { key: 4, name: 'Data plane proxies', value: this.proxyCount() },
+      { key: 1, name: <Trans>{productName} version</Trans>, value: releaseVersion },
+      { key: 2, name: <Trans>{productName} namespace</Trans>, value: controllerNamespace },
+      { key: 3, name: <Trans>Control plane components</Trans>, value: components.length },
+      { key: 4, name: <Trans>Data plane proxies</Trans>, value: this.proxyCount() },
     ];
   }
 
@@ -122,7 +118,7 @@ class ServiceMesh extends React.Component {
         name: component,
         pods: _map(byDeployName[deployName], p => {
           const uptimeSec = !p.uptime ? 0 : parseInt(p.uptime.split('.')[0], 10);
-          const uptime = distanceInWordsToNow(subSeconds(Date.now(), uptimeSec));
+          const uptime = formatDistanceToNow(subSeconds(Date.now(), uptimeSec));
 
           return {
             name: p.name,
@@ -149,7 +145,7 @@ class ServiceMesh extends React.Component {
 
   extractNsStatuses = nsData => {
     const podsByNs = _get(nsData, ['ok', 'statTables', 0, 'podGroup', 'rows'], []);
-    const dataPlaneNamepaces = podsByNs.map(ns => {
+    const dataPlaneNamespaces = podsByNs.map(ns => {
       const meshedPods = parseInt(ns.meshedPodCount, 10);
       const totalPods = parseInt(ns.runningPodCount, 10);
       const failedPods = parseInt(ns.failedPodCount, 10);
@@ -164,7 +160,7 @@ class ServiceMesh extends React.Component {
         errors: ns.errorsByPod,
       };
     });
-    return _compact(dataPlaneNamepaces);
+    return _compact(dataPlaneNamespaces);
   }
 
   loadFromServer() {
@@ -222,10 +218,10 @@ class ServiceMesh extends React.Component {
       <React.Fragment>
         <Grid container justify="space-between">
           <Grid item xs={3}>
-            <Typography variant="h6">Control plane</Typography>
+            <Typography variant="h6"><Trans>Control plane</Trans></Typography>
           </Grid>
           <Grid item xs={3}>
-            <Typography align="right">Components</Typography>
+            <Typography align="right"><Trans>componentsMsg</Trans></Typography>
             <Typography align="right">{components.length}</Typography>
           </Grid>
         </Grid>
@@ -233,8 +229,7 @@ class ServiceMesh extends React.Component {
         <StatusTable
           data={components}
           statusColumnTitle="Pod Status"
-          shouldLink={false}
-          api={this.api} />
+          shouldLink={false} />
       </React.Fragment>
     );
   }
@@ -242,7 +237,7 @@ class ServiceMesh extends React.Component {
   renderServiceMeshDetails() {
     return (
       <React.Fragment>
-        <Typography variant="h6">Service mesh details</Typography>
+        <Typography variant="h6"><Trans>Service mesh details</Trans></Typography>
 
         <BaseTable
           tableClassName="metric-table"
@@ -262,14 +257,18 @@ class ServiceMesh extends React.Component {
     let numUnadded = 0;
 
     if (_isEmpty(nsStatuses)) {
-      message = 'No resources detected.';
+      message = <Trans>noNamespacesDetectedMsg</Trans>;
     } else {
       const meshedCount = _countBy(nsStatuses, pod => {
         return pod.meshedPercent.get() > 0;
       });
       numUnadded = meshedCount.false || 0;
-      message = numUnadded === 0 ? `All namespaces have a ${productName} install.` :
-        `${numUnadded} ${numUnadded === 1 ? 'namespace has' : 'namespaces have'} no meshed resources.`;
+      message = numUnadded === 0 ? <Trans>All namespaces have a {productName} install.</Trans> : (
+        <Plural
+          value={numUnadded}
+          one="# namespace has no meshed resources"
+          other="# namespaces have no meshed resources" />
+      );
     }
 
     return (

@@ -11,12 +11,11 @@ import (
 	"time"
 
 	"github.com/julienschmidt/httprouter"
-	"github.com/linkerd/linkerd2/controller/api/public"
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
 	"github.com/linkerd/linkerd2/pkg/filesonly"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/prometheus"
+	vizPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"github.com/patrickmn/go-cache"
 	log "github.com/sirupsen/logrus"
 )
@@ -46,12 +45,14 @@ type (
 		Contents interface{}
 	}
 	appParams struct {
-		Data                pb.VersionInfo
 		UUID                string
+		ReleaseVersion      string
 		ControllerNamespace string
 		Error               bool
 		ErrorMessage        string
 		PathPrefix          string
+		Jaeger              string
+		Grafana             string
 	}
 
 	healthChecker interface {
@@ -62,13 +63,12 @@ type (
 // this is called by the HTTP server to actually respond to a request
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if !s.reHost.MatchString(req.Host) {
-		error := fmt.Sprintf(`It appears that you are trying to reach this service with a host of '%s'.
+		err := fmt.Sprintf(`It appears that you are trying to reach this service with a host of '%s'.
 This does not match /%s/ and has been denied for security reasons.
 Please see https://linkerd.io/dns-rebinding for an explanation of what is happening and how to fix it.`,
 			html.EscapeString(req.Host),
 			html.EscapeString(s.reHost.String()))
-
-		http.Error(w, error, http.StatusBadRequest)
+		http.Error(w, err, http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -83,14 +83,16 @@ Please see https://linkerd.io/dns-rebinding for an explanation of what is happen
 func NewServer(
 	addr string,
 	grafanaAddr string,
+	jaegerAddr string,
 	templateDir string,
 	staticDir string,
 	uuid string,
+	version string,
 	controllerNamespace string,
 	clusterDomain string,
 	reload bool,
 	reHost *regexp.Regexp,
-	apiClient public.APIClient,
+	apiClient vizPb.ApiClient,
 	k8sAPI *k8s.KubernetesAPI,
 	hc healthChecker,
 ) *http.Server {
@@ -112,9 +114,13 @@ func NewServer(
 		k8sAPI:              k8sAPI,
 		render:              server.RenderTemplate,
 		uuid:                uuid,
+		version:             version,
 		controllerNamespace: controllerNamespace,
 		clusterDomain:       clusterDomain,
-		grafanaProxy:        newGrafanaProxy(grafanaAddr),
+		grafanaProxy:        newReverseProxy(grafanaAddr, "/grafana"),
+		jaegerProxy:         newReverseProxy(jaegerAddr, ""),
+		grafana:             grafanaAddr,
+		jaeger:              jaegerAddr,
 		hc:                  hc,
 		statCache:           cache.New(statExpiration, statCleanupInterval),
 	}
@@ -130,6 +136,7 @@ func NewServer(
 	server.router.GET("/", handler.handleIndex)
 	server.router.GET("/controlplane", handler.handleIndex)
 	server.router.GET("/namespaces", handler.handleIndex)
+	server.router.GET("/gateways", handler.handleIndex)
 
 	// paths for a list of resources by namespace
 	server.router.GET("/namespaces/:namespace/daemonsets", handler.handleIndex)
@@ -187,15 +194,14 @@ func NewServer(
 	server.router.GET("/api/edges", handler.handleAPIEdges)
 	server.router.GET("/api/check", handler.handleAPICheck)
 	server.router.GET("/api/resource-definition", handler.handleAPIResourceDefinition)
+	server.router.GET("/api/gateways", handler.handleAPIGateways)
+	server.router.GET("/api/extension", handler.handleGetExtension)
 
 	// grafana proxy
-	server.router.DELETE("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.GET("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.HEAD("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.OPTIONS("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.PATCH("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.POST("/grafana/*grafanapath", handler.handleGrafana)
-	server.router.PUT("/grafana/*grafanapath", handler.handleGrafana)
+	server.handleAllOperationsForPath("/grafana/*grafanapath", handler.handleGrafana)
+
+	// jaeger proxy
+	server.handleAllOperationsForPath("/jaeger/*jaegerpath", handler.handleJaeger)
 
 	return httpServer
 }
@@ -239,6 +245,16 @@ func (s *Server) loadTemplate(templateFile string) (template *template.Template,
 		}
 	}
 	return template, err
+}
+
+func (s *Server) handleAllOperationsForPath(path string, handle httprouter.Handle) {
+	s.router.DELETE(path, handle)
+	s.router.GET(path, handle)
+	s.router.HEAD(path, handle)
+	s.router.OPTIONS(path, handle)
+	s.router.PATCH(path, handle)
+	s.router.POST(path, handle)
+	s.router.PUT(path, handle)
 }
 
 func safelyJoinPath(rootPath, userPath string) string {

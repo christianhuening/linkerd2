@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	pb "github.com/linkerd/linkerd2/controller/gen/public"
+	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -60,10 +60,10 @@ func TestHttpRequestToProto(t *testing.T) {
 	someMethod := http.MethodPost
 
 	t.Run("Given a valid request, serializes its contents into protobuf object", func(t *testing.T) {
-		expectedProtoMessage := pb.Pod{
+		expectedProtoMessage := metricsPb.Pod{
 			Name:                "some-name",
 			PodIP:               "some-name",
-			Owner:               &pb.Pod_Deployment{Deployment: "some-name"},
+			Owner:               &metricsPb.Pod_Deployment{Deployment: "some-name"},
 			Status:              "some-name",
 			Added:               false,
 			ControllerNamespace: "some-name",
@@ -79,19 +79,19 @@ func TestHttpRequestToProto(t *testing.T) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		var actualProtoMessage pb.Pod
+		var actualProtoMessage metricsPb.Pod
 		err = HTTPRequestToProto(req, &actualProtoMessage)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
 		if !proto.Equal(&actualProtoMessage, &expectedProtoMessage) {
-			t.Fatalf("Expected request to be [%v], but got [%v]", expectedProtoMessage, actualProtoMessage)
+			t.Fatalf("Expected request to be [%s], but got [%s]", expectedProtoMessage.String(), actualProtoMessage.String())
 		}
 	})
 
 	t.Run("Given a broken request, returns http error", func(t *testing.T) {
-		var actualProtoMessage pb.Pod
+		var actualProtoMessage metricsPb.Pod
 
 		req, err := http.NewRequest(someMethod, someURL, strings.NewReader("not really protobuf"))
 		if err != nil {
@@ -135,15 +135,15 @@ func TestWriteErrorToHttpResponse(t *testing.T) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		expectedErrorPayload := pb.ApiError{Error: genericError.Error()}
-		var actualErrorPayload pb.ApiError
+		expectedErrorPayload := metricsPb.ApiError{Error: genericError.Error()}
+		var actualErrorPayload metricsPb.ApiError
 		err = proto.Unmarshal(payloadRead, &actualErrorPayload)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
 		if !proto.Equal(&actualErrorPayload, &expectedErrorPayload) {
-			t.Fatalf("Expecting error to be serialized as [%v], but got [%v]", expectedErrorPayload, actualErrorPayload)
+			t.Fatalf("Expecting error to be serialized as [%s], but got [%s]", expectedErrorPayload.String(), actualErrorPayload.String())
 		}
 	})
 
@@ -169,15 +169,15 @@ func TestWriteErrorToHttpResponse(t *testing.T) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		expectedErrorPayload := pb.ApiError{Error: httpError.WrappedError.Error()}
-		var actualErrorPayload pb.ApiError
+		expectedErrorPayload := metricsPb.ApiError{Error: httpError.WrappedError.Error()}
+		var actualErrorPayload metricsPb.ApiError
 		err = proto.Unmarshal(payloadRead, &actualErrorPayload)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
 		if !proto.Equal(&actualErrorPayload, &expectedErrorPayload) {
-			t.Fatalf("Expecting error to be serialized as [%v], but got [%v]", expectedErrorPayload, actualErrorPayload)
+			t.Fatalf("Expecting error to be serialized as [%s], but got [%s]", expectedErrorPayload.String(), actualErrorPayload.String())
 		}
 	})
 
@@ -202,48 +202,15 @@ func TestWriteErrorToHttpResponse(t *testing.T) {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		expectedErrorPayload := pb.ApiError{Error: expectedErrorMessage}
-		var actualErrorPayload pb.ApiError
+		expectedErrorPayload := metricsPb.ApiError{Error: expectedErrorMessage}
+		var actualErrorPayload metricsPb.ApiError
 		err = proto.Unmarshal(payloadRead, &actualErrorPayload)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		if !reflect.DeepEqual(actualErrorPayload, expectedErrorPayload) {
-			t.Fatalf("Expecting error to be serialized as [%v], but got [%v]", expectedErrorPayload, actualErrorPayload)
-		}
-	})
-}
-
-func TestWriteProtoToHttpResponse(t *testing.T) {
-	t.Run("Writes valid payload", func(t *testing.T) {
-		expectedMessage := pb.VersionInfo{
-			ReleaseVersion: "0.0.1",
-			BuildDate:      "02/21/1983",
-			GoVersion:      "10.2.45",
-		}
-
-		responseWriter := newStubResponseWriter()
-		err := WriteProtoToHTTPResponse(responseWriter, &expectedMessage)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		assertResponseHasProtobufContentType(t, responseWriter)
-
-		payloadRead, err := deserializePayloadFromReader(bufio.NewReader(bytes.NewReader(responseWriter.body.Bytes())))
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		var actualMessage pb.VersionInfo
-		err = proto.Unmarshal(payloadRead, &actualMessage)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		if !proto.Equal(&actualMessage, &expectedMessage) {
-			t.Fatalf("Expected response body to contain message [%v], but got [%v]", expectedMessage, actualMessage)
+		if actualErrorPayload.String() != expectedErrorPayload.String() {
+			t.Fatalf("Expecting error to be serialized as [%s], but got [%s]", expectedErrorPayload.String(), actualErrorPayload.String())
 		}
 	})
 }
@@ -298,50 +265,6 @@ func TestDeserializePayloadFromReader(t *testing.T) {
 
 		if string(actualMessage2) != expectedMessage2 {
 			t.Fatalf("Expecting payload to contain message:\n%s\nbut it had\n%s", expectedMessage2, actualMessage2)
-		}
-	})
-
-	t.Run("Can write and read marshalled protobuf messages", func(t *testing.T) {
-		expectedMessage := &pb.VersionInfo{
-			GoVersion:      "1.9.1",
-			BuildDate:      "2017.11.17",
-			ReleaseVersion: "1.2.3",
-		}
-
-		expectedReadArray, err := proto.Marshal(expectedMessage)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		serialized := SerializeAsPayload(expectedReadArray)
-
-		reader := bufio.NewReader(bytes.NewReader(serialized))
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		actualReadArray, err := deserializePayloadFromReader(reader)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		if !reflect.DeepEqual(actualReadArray, expectedReadArray) {
-			n := len(actualReadArray)
-			xor := make([]byte, n)
-			for i := 0; i < n; i++ {
-				xor[i] = actualReadArray[i] ^ expectedReadArray[i]
-			}
-			t.Fatalf("Expecting read byte array to be equal to written byte array, but they were different. xor: [%v]", xor)
-		}
-
-		actualMessage := &pb.VersionInfo{}
-		err = proto.Unmarshal(actualReadArray, actualMessage)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		if !proto.Equal(actualMessage, expectedMessage) {
-			t.Fatalf("Expecting payload to contain message [%s], but it had [%s]", expectedMessage, actualMessage)
 		}
 	})
 
@@ -409,7 +332,7 @@ func TestNewStreamingWriter(t *testing.T) {
 		}
 	})
 
-	t.Run("Returns an error if writer doesnt support streaming", func(t *testing.T) {
+	t.Run("Returns an error if writer does not support streaming", func(t *testing.T) {
 		_, err := NewStreamingWriter(&nonStreamingResponseWriter{})
 		if err == nil {
 			t.Fatalf("Expecting error, got nothing")
@@ -431,7 +354,7 @@ func TestCheckIfResponseHasError(t *testing.T) {
 
 	t.Run("returns error in body if response contains linkerd-error header", func(t *testing.T) {
 		expectedErrorMessage := "expected error message"
-		protoInBytes, err := proto.Marshal(&pb.ApiError{Error: expectedErrorMessage})
+		protoInBytes, err := proto.Marshal(&metricsPb.ApiError{Error: expectedErrorMessage})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -452,27 +375,6 @@ func TestCheckIfResponseHasError(t *testing.T) {
 		actualErrorMessage := err.Error()
 		if actualErrorMessage != expectedErrorMessage {
 			t.Fatalf("Expected error message to be [%s], but it was [%s]", expectedErrorMessage, actualErrorMessage)
-		}
-	})
-
-	t.Run("returns error if response contains linkerd-error header but body isn't error message", func(t *testing.T) {
-		protoInBytes, err := proto.Marshal(&pb.VersionInfo{ReleaseVersion: "0.0.1"})
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-
-		message := SerializeAsPayload(protoInBytes)
-
-		response := &http.Response{
-			Header:     make(http.Header),
-			Body:       ioutil.NopCloser(bytes.NewReader(message)),
-			StatusCode: http.StatusInternalServerError,
-		}
-		response.Header.Set(errorHeader, "error")
-
-		err = CheckIfResponseHasError(response)
-		if err == nil {
-			t.Fatalf("Expecting error, got nothing")
 		}
 	})
 
@@ -521,51 +423,6 @@ func TestCheckIfResponseHasError(t *testing.T) {
 			t.Fatalf("Expected error message to be [%s], but it was [%s]", expectedErrorMessage, actualErrorMessage)
 		}
 	})
-}
-
-func TestTapReqToURL(t *testing.T) {
-	expectations := []struct {
-		req *pb.TapByResourceRequest
-		url string
-	}{
-		{
-			req: &pb.TapByResourceRequest{},
-			url: "/apis/tap.linkerd.io/v1alpha1/watch/namespaces//s//tap",
-		},
-		{
-			req: &pb.TapByResourceRequest{
-				Target: &pb.ResourceSelection{
-					Resource: &pb.Resource{
-						Type: "namespace",
-						Name: "test-name",
-					},
-				},
-			},
-			url: "/apis/tap.linkerd.io/v1alpha1/watch/namespaces/test-name/tap",
-		},
-		{
-			req: &pb.TapByResourceRequest{
-				Target: &pb.ResourceSelection{
-					Resource: &pb.Resource{
-						Namespace: "test-ns",
-						Type:      "test-type",
-						Name:      "test-name",
-					},
-				},
-			},
-			url: "/apis/tap.linkerd.io/v1alpha1/watch/namespaces/test-ns/test-types/test-name/tap",
-		},
-	}
-	for i, exp := range expectations {
-		exp := exp // pin
-
-		t.Run(fmt.Sprintf("%d constructs the expected URL from a TapRequest", i), func(t *testing.T) {
-			url := TapReqToURL(exp.req)
-			if url != exp.url {
-				t.Fatalf("Unexpected url: %s, Expected: %s", url, exp.url)
-			}
-		})
-	}
 }
 
 func assertResponseHasProtobufContentType(t *testing.T, responseWriter *stubResponseWriter) {

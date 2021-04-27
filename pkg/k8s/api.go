@@ -1,12 +1,14 @@
 package k8s
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
-	tsclient "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
 	"github.com/linkerd/linkerd2/pkg/prometheus"
+	tsclient "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -16,12 +18,13 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	apiregistration "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 
 	// Load all the auth plugins for the cloud providers.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
-var minAPIVersion = [3]int{1, 13, 0}
+var minAPIVersion = [3]int{1, 16, 0}
 
 // KubernetesAPI provides a client for accessing a Kubernetes cluster.
 // TODO: support ServiceProfile ClientSet. A prerequisite is moving the
@@ -31,9 +34,10 @@ var minAPIVersion = [3]int{1, 13, 0}
 type KubernetesAPI struct {
 	*rest.Config
 	kubernetes.Interface
-	Apiextensions apiextensionsclient.Interface // for CRDs
-	TsClient      tsclient.Interface
-	DynamicClient dynamic.Interface
+	Apiextensions   apiextensionsclient.Interface // for CRDs
+	Apiregistration apiregistration.Interface     // for access to APIService
+	TsClient        tsclient.Interface
+	DynamicClient   dynamic.Interface
 }
 
 // NewAPI validates a Kubernetes config and returns a client for accessing the
@@ -43,6 +47,12 @@ func NewAPI(configPath, kubeContext string, impersonate string, impersonateGroup
 	if err != nil {
 		return nil, fmt.Errorf("error configuring Kubernetes API client: %v", err)
 	}
+	return NewAPIForConfig(config, impersonate, impersonateGroup, timeout)
+}
+
+// NewAPIForConfig uses a Kubernetes config to construct a client for accessing
+// the configured cluster
+func NewAPIForConfig(config *rest.Config, impersonate string, impersonateGroup []string, timeout time.Duration) (*KubernetesAPI, error) {
 
 	// k8s' client-go doesn't support injecting context
 	// https://github.com/kubernetes/kubernetes/issues/46503
@@ -66,6 +76,10 @@ func NewAPI(configPath, kubeContext string, impersonate string, impersonateGroup
 	if err != nil {
 		return nil, fmt.Errorf("error configuring Kubernetes API Extensions clientset: %v", err)
 	}
+	aggregatorClient, err := apiregistration.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("error configuring Kubernetes API server aggregator: %v", err)
+	}
 	tsClient, err := tsclient.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("error configuring Traffic Split clientset: %v", err)
@@ -76,11 +90,12 @@ func NewAPI(configPath, kubeContext string, impersonate string, impersonateGroup
 	}
 
 	return &KubernetesAPI{
-		Config:        config,
-		Interface:     clientset,
-		Apiextensions: apiextensions,
-		TsClient:      tsClient,
-		DynamicClient: dynamicClient,
+		Config:          config,
+		Interface:       clientset,
+		Apiextensions:   apiextensions,
+		Apiregistration: aggregatorClient,
+		TsClient:        tsClient,
+		DynamicClient:   dynamicClient,
 	}, nil
 }
 
@@ -120,8 +135,8 @@ func (kubeAPI *KubernetesAPI) CheckVersion(versionInfo *version.Info) error {
 }
 
 // NamespaceExists validates whether a given namespace exists.
-func (kubeAPI *KubernetesAPI) NamespaceExists(namespace string) (bool, error) {
-	ns, err := kubeAPI.CoreV1().Namespaces().Get(namespace, metav1.GetOptions{})
+func (kubeAPI *KubernetesAPI) NamespaceExists(ctx context.Context, namespace string) (bool, error) {
+	ns, err := kubeAPI.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 	if kerrors.IsNotFound(err) {
 		return false, nil
 	}
@@ -133,8 +148,8 @@ func (kubeAPI *KubernetesAPI) NamespaceExists(namespace string) (bool, error) {
 }
 
 // GetPodsByNamespace returns all pods in a given namespace
-func (kubeAPI *KubernetesAPI) GetPodsByNamespace(namespace string) ([]corev1.Pod, error) {
-	podList, err := kubeAPI.CoreV1().Pods(namespace).List(metav1.ListOptions{})
+func (kubeAPI *KubernetesAPI) GetPodsByNamespace(ctx context.Context, namespace string) ([]corev1.Pod, error) {
+	podList, err := kubeAPI.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -142,13 +157,38 @@ func (kubeAPI *KubernetesAPI) GetPodsByNamespace(namespace string) ([]corev1.Pod
 }
 
 // GetReplicaSets returns all replicasets in a given namespace
-func (kubeAPI *KubernetesAPI) GetReplicaSets(namespace string) ([]appsv1.ReplicaSet, error) {
-	replicaSetList, err := kubeAPI.AppsV1().ReplicaSets(namespace).List(metav1.ListOptions{})
+func (kubeAPI *KubernetesAPI) GetReplicaSets(ctx context.Context, namespace string) ([]appsv1.ReplicaSet, error) {
+	replicaSetList, err := kubeAPI.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	return replicaSetList.Items, nil
+}
+
+// GetAllNamespacesWithExtensionLabel gets all namespaces with the linkerd.io/extension label key
+func (kubeAPI *KubernetesAPI) GetAllNamespacesWithExtensionLabel(ctx context.Context) ([]corev1.Namespace, error) {
+	namespaces, err := kubeAPI.CoreV1().Namespaces().List(ctx, metav1.ListOptions{LabelSelector: LinkerdExtensionLabel})
+	if err != nil {
+		return nil, err
+	}
+
+	return namespaces.Items, nil
+}
+
+// GetNamespaceWithExtensionLabel gets the namespace with the LinkerdExtensionLabel label value of `value`
+func (kubeAPI *KubernetesAPI) GetNamespaceWithExtensionLabel(ctx context.Context, value string) (*corev1.Namespace, error) {
+	namespaces, err := kubeAPI.GetAllNamespacesWithExtensionLabel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ns := range namespaces {
+		if ns.Labels[LinkerdExtensionLabel] == value {
+			return &ns, err
+		}
+	}
+	return nil, fmt.Errorf("could not find the %s extension", value)
 }
 
 // GetPodStatus receives a pod and returns the pod status, based on `kubectl` logic.
@@ -168,7 +208,7 @@ func GetPodStatus(pod corev1.Pod) string {
 			continue
 		case container.State.Terminated != nil:
 			// initialization is failed
-			if len(container.State.Terminated.Reason) == 0 {
+			if container.State.Terminated.Reason == "" {
 				if container.State.Terminated.Signal != 0 {
 					reason = fmt.Sprintf("Init:Signal:%d", container.State.Terminated.Signal)
 				} else {
@@ -214,4 +254,35 @@ func GetPodStatus(pod corev1.Pod) string {
 	}
 
 	return reason
+}
+
+// GetProxyReady returns true if the pod contains a proxy that is ready
+func GetProxyReady(pod corev1.Pod) bool {
+	for _, container := range pod.Status.ContainerStatuses {
+		if container.Name == ProxyContainerName {
+			return container.Ready
+		}
+	}
+	return false
+}
+
+// GetProxyVersion returns the container proxy's version, if any
+func GetProxyVersion(pod corev1.Pod) string {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == ProxyContainerName {
+			parts := strings.Split(container.Image, ":")
+			return parts[1]
+		}
+	}
+	return ""
+}
+
+// GetAddOnsConfigMap returns the data in the add-ons configmap
+func GetAddOnsConfigMap(ctx context.Context, kubeAPI kubernetes.Interface, namespace string) (map[string]string, error) {
+	cm, err := kubeAPI.CoreV1().ConfigMaps(namespace).Get(ctx, AddOnsConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return cm.Data, nil
 }

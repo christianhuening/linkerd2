@@ -5,14 +5,13 @@ import (
 	"io"
 	"strings"
 
-	tsclient "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
-	tsfake "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/clientset/versioned/fake"
 	spclient "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned"
 	spfake "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned/fake"
+	tsclient "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
+	tsfake "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned/fake"
 
-	tsscheme "github.com/deislabs/smi-sdk-go/pkg/gen/client/split/clientset/versioned/scheme"
 	spscheme "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned/scheme"
-	log "github.com/sirupsen/logrus"
+	tsscheme "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned/scheme"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
@@ -34,29 +33,31 @@ import (
 
 // NewFakeAPI provides a mock KubernetesAPI backed by hard-coded resources
 func NewFakeAPI(configs ...string) (*KubernetesAPI, error) {
-	client, apiextClient, _, _, _, err := NewFakeClientSets(configs...)
+	client, apiextClient, apiregClient, _, _, err := NewFakeClientSets(configs...)
 	if err != nil {
 		return nil, err
 	}
 
 	return &KubernetesAPI{
-		Config:        &rest.Config{},
-		Interface:     client,
-		Apiextensions: apiextClient,
+		Config:          &rest.Config{},
+		Interface:       client,
+		Apiextensions:   apiextClient,
+		Apiregistration: apiregClient,
 	}, nil
 }
 
 // NewFakeAPIFromManifests reads from a slice of readers, each representing a
 // manifest or collection of manifests, and returns a mock KubernetesAPI.
 func NewFakeAPIFromManifests(readers []io.Reader) (*KubernetesAPI, error) {
-	client, apiextClient, _, _, _, err := newFakeClientSetsFromManifests(readers)
+	client, apiextClient, apiregClient, _, _, err := newFakeClientSetsFromManifests(readers)
 	if err != nil {
 		return nil, err
 	}
 
 	return &KubernetesAPI{
-		Interface:     client,
-		Apiextensions: apiextClient,
+		Interface:       client,
+		Apiextensions:   apiextClient,
+		Apiregistration: apiregClient,
 	}, nil
 }
 
@@ -115,6 +116,7 @@ func NewFakeClientSets(configs ...string) (
 // newFakeClientSetsFromManifests reads from a slice of readers, each
 // representing a manifest or collection of manifests, and returns a mock
 // Kubernetes ClientSet.
+//nolint:unparam
 func newFakeClientSetsFromManifests(readers []io.Reader) (
 	kubernetes.Interface,
 	apiextensionsclient.Interface,
@@ -147,7 +149,7 @@ func newFakeClientSetsFromManifests(readers []io.Reader) (
 
 			switch typeMeta.Kind {
 			case "":
-				log.Warnf("Kind missing from YAML, skipping")
+				// Kind missing from YAML, skipping
 
 			case "List":
 				var sourceList corev1.List

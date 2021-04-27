@@ -1,0 +1,74 @@
+{{if .Values.gateway -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    {{ include "partials.annotations.created-by" . }}
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: Linkerd
+    app.kubernetes.io/version: {{.Values.linkerdVersion}}
+    linkerd.io/control-plane-component: gateway
+    app: {{.Values.gatewayName}}
+    linkerd.io/extension: multicluster
+  name: {{.Values.gatewayName}}
+  namespace: {{.Values.namespace}}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{.Values.gatewayName}}
+  template:
+    metadata:
+      annotations:
+        {{ include "partials.annotations.created-by" . }}
+        linkerd.io/inject: enabled
+        config.linkerd.io/proxy-require-identity-inbound-ports: "{{.Values.gatewayProbePort}},{{.Values.gatewayPort}}"
+        config.linkerd.io/enable-gateway: "true"
+      labels:
+        app: {{.Values.gatewayName}}
+    spec:
+      containers:
+        - name: pause
+          image: gcr.io/google_containers/pause
+      serviceAccountName: {{.Values.gatewayName}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{.Values.gatewayName}}
+  namespace: {{.Values.namespace}}
+  labels:
+    linkerd.io/extension: multicluster
+  annotations:
+    mirror.linkerd.io/gateway-identity: {{.Values.gatewayName}}.{{.Values.namespace}}.serviceaccount.identity.{{.Values.linkerdNamespace}}.{{.Values.identityTrustDomain}}
+    mirror.linkerd.io/probe-period: "{{.Values.gatewayProbeSeconds}}"
+    mirror.linkerd.io/probe-path: {{.Values.gatewayProbePath}}
+    mirror.linkerd.io/multicluster-gateway: "true"
+    linkerd.io/control-plane-component: gateway
+    {{ include "partials.annotations.created-by" . }}
+    {{- with .Values.gatewayServiceAnnotations }}{{ toYaml . | trim | nindent 4 }}{{- end }}
+spec:
+  ports:
+  - name: mc-gateway
+    port: {{.Values.gatewayPort}}
+    protocol: TCP
+  - name: mc-probe
+    port: {{.Values.gatewayProbePort}}
+    protocol: TCP
+  selector:
+    app: {{.Values.gatewayName}}
+  type: {{ .Values.gatewayServiceType }}
+{{- if .Values.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.loadBalancerIP }}
+{{- end }}
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: {{.Values.gatewayName}}
+  namespace: {{.Values.namespace}}
+  labels:
+    linkerd.io/extension: multicluster
+{{end -}}

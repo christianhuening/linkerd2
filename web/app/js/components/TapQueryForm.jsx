@@ -7,13 +7,13 @@ import {
   tapQueryProps,
   tapResourceTypes,
 } from './util/TapUtils.jsx';
+import Accordion from '@material-ui/core/Accordion';
+import AccordionDetails from '@material-ui/core/AccordionDetails';
+import AccordionSummary from '@material-ui/core/AccordionSummary';
 import Button from '@material-ui/core/Button';
 import Card from '@material-ui/core/Card';
 import CardContent from '@material-ui/core/CardContent';
 import ExpandMoreIcon from '@material-ui/icons/ExpandMore';
-import ExpansionPanel from '@material-ui/core/ExpansionPanel';
-import ExpansionPanelDetails from '@material-ui/core/ExpansionPanelDetails';
-import ExpansionPanelSummary from '@material-ui/core/ExpansionPanelSummary';
 import FormControl from '@material-ui/core/FormControl';
 import FormHelperText from '@material-ui/core/FormHelperText';
 import Grid from '@material-ui/core/Grid';
@@ -24,6 +24,7 @@ import QueryToCliCmd from './QueryToCliCmd.jsx';
 import React from 'react';
 import Select from '@material-ui/core/Select';
 import TextField from '@material-ui/core/TextField';
+import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
 import _flatten from 'lodash/flatten';
 import _isEmpty from 'lodash/isEmpty';
@@ -35,11 +36,9 @@ import _noop from 'lodash/noop';
 import _omit from 'lodash/omit';
 import _pick from 'lodash/pick';
 import _some from 'lodash/some';
-import _startCase from 'lodash/startCase';
 import _uniq from 'lodash/uniq';
 import _values from 'lodash/values';
 import { withStyles } from '@material-ui/core/styles';
-
 
 const getResourceList = (resourcesByNs, ns) => {
   return resourcesByNs[ns] || _uniq(_flatten(_values(resourcesByNs)));
@@ -93,7 +92,6 @@ const styles = theme => ({
     marginLeft: theme.spacing(1),
   },
 });
-
 
 class TapQueryForm extends React.Component {
   static getDerivedStateFromProps(props, state) {
@@ -244,7 +242,7 @@ class TapQueryForm extends React.Component {
 
     return (
       <React.Fragment>
-        <InputLabel htmlFor={resourceKey}>{_startCase(resourceKey)}</InputLabel>
+        <InputLabel htmlFor={resourceKey}>{resourceKey === 'resource' ? <Trans>formResource</Trans> : <Trans>formToResource</Trans>}</InputLabel>
         <Select
           value={!nsEmpty && resourceOptions.includes(query[resourceKey]) ? query[resourceKey] : ''}
           onChange={this.handleFormChange(resourceKey)}
@@ -287,9 +285,17 @@ class TapQueryForm extends React.Component {
     const { handleTapStart, handleTapStop } = this.props;
 
     if (tapIsClosing) {
-      return (<Button variant="outlined" color="primary" className="tap-ctrl tap-stop" disabled>Stop</Button>);
+      return (
+        <Button variant="outlined" color="primary" className="tap-ctrl tap-stop" disabled>
+          <Trans>buttonStop</Trans>
+        </Button>
+      );
     } else if (tapInProgress) {
-      return (<Button variant="outlined" color="primary" className="tap-ctrl tap-stop" onClick={handleTapStop}>Stop</Button>);
+      return (
+        <Button variant="outlined" color="primary" className="tap-ctrl tap-stop" onClick={handleTapStop}>
+          <Trans>buttonStop</Trans>
+        </Button>
+      );
     } else {
       return (
         <Button
@@ -298,7 +304,7 @@ class TapQueryForm extends React.Component {
           className="tap-ctrl tap-start"
           disabled={!query.namespace || !query.resource}
           onClick={handleTapStart}>
-          Start
+          <Trans>buttonStart</Trans>
         </Button>
       );
     }
@@ -330,7 +336,7 @@ class TapQueryForm extends React.Component {
         <Grid container spacing={3}>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
             <FormControl className={classes.formControl}>
-              {this.renderNamespaceSelect('To Namespace', 'toNamespace', 'toResource')}
+              {this.renderNamespaceSelect(<Trans>formToNamespace</Trans>, 'toNamespace', 'toResource')}
             </FormControl>
           </Grid>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
@@ -343,48 +349,48 @@ class TapQueryForm extends React.Component {
         <Grid container spacing={3}>
           <Grid item xs={6} md={3} classes={{ item: classes.formControlWrapper }}>
             <FormControl className={classes.formControl}>
-              <InputLabel htmlFor="authority">Authority</InputLabel>
+              <InputLabel htmlFor="authority"><Trans>formAuthority</Trans></InputLabel>
               <Select
                 value={query.authority}
                 onChange={this.handleFormChange('authority')}
                 inputProps={{ name: 'authority', id: 'authority' }}
                 className={classes.selectEmpty}>
                 {
-                _map(autocomplete.authority, (d, i) => (
-                  <MenuItem key={`authority-${i}`} value={d}>{d}</MenuItem>
-                ))
-              }
+                  _map(autocomplete.authority, (d, i) => (
+                    <MenuItem key={`authority-${i}`} value={d}>{d}</MenuItem>
+                  ))
+                }
               </Select>
-              <FormHelperText>Display requests with this :authority</FormHelperText>
+              <FormHelperText><Trans>formAuthorityHelpText</Trans></FormHelperText>
             </FormControl>
           </Grid>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
-            { this.renderTextInput('Path', 'path', 'Display requests with paths that start with this prefix') }
+            {this.renderTextInput(<Trans>formPath</Trans>, 'path', <Trans>formPathHelpText</Trans>)}
           </Grid>
         </Grid>
 
         <Grid container spacing={3}>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
-            { this.renderTextInput('Scheme', 'scheme', 'Display requests with this scheme') }
+            {this.renderTextInput(<Trans>formScheme</Trans>, 'scheme', <Trans>formSchemeHelpText</Trans>)}
           </Grid>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
-            { this.renderTextInput('Max RPS', 'maxRps', `Maximum requests per second to tap. Default ${defaultMaxRps}`) }
+            {this.renderTextInput(<Trans>formMaxRPS</Trans>, 'maxRps', <Trans>formMaxRPSHelpText {defaultMaxRps}</Trans>)}
           </Grid>
           <Grid item xs={6} md={3} className={classes.formControlWrapper}>
             <FormControl className={classes.formControl}>
-              <InputLabel htmlFor="method">HTTP method</InputLabel>
+              <InputLabel htmlFor="method"><Trans>formHTTPMethod</Trans></InputLabel>
               <Select
                 value={query.method}
                 onChange={this.handleFormChange('method')}
                 inputProps={{ name: 'method', id: 'method' }}
                 className={classes.selectEmpty}>
                 {
-                _map(httpMethods, d => (
-                  <MenuItem key={`method-${d}`} value={d}>{d}</MenuItem>
-                ))
-              }
+                  _map(httpMethods, d => (
+                    <MenuItem key={`method-${d}`} value={d}>{d}</MenuItem>
+                  ))
+                }
               </Select>
-              <FormHelperText>Display requests with this HTTP method</FormHelperText>
+              <FormHelperText><Trans>formHTTPMethodHelpText</Trans></FormHelperText>
             </FormControl>
           </Grid>
         </Grid>
@@ -397,17 +403,17 @@ class TapQueryForm extends React.Component {
     const { advancedFormExpanded } = this.state;
 
     return (
-      <ExpansionPanel expanded={advancedFormExpanded} onChange={this.handleAdvancedFormExpandClick} elevation={3}>
-        <ExpansionPanelSummary expandIcon={<ExpandMoreIcon />}>
+      <Accordion expanded={advancedFormExpanded} onChange={this.handleAdvancedFormExpandClick} elevation={3}>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
           <Typography variant="caption" gutterBottom>
-            {advancedFormExpanded ? 'Hide filters' : 'Show more filters'}
+            {advancedFormExpanded ? <Trans>formHideFilters</Trans> : <Trans>formShowFilters</Trans>}
           </Typography>
-        </ExpansionPanelSummary>
+        </AccordionSummary>
 
-        <ExpansionPanelDetails>
+        <AccordionDetails>
           {this.renderAdvancedTapFormContent()}
-        </ExpansionPanelDetails>
-      </ExpansionPanel>
+        </AccordionDetails>
+      </Accordion>
     );
   }
 
@@ -421,7 +427,7 @@ class TapQueryForm extends React.Component {
           <Grid container spacing={3}>
             <Grid item xs={6} md="auto" className={classes.formControlWrapper}>
               <FormControl className={classes.formControl} fullWidth>
-                {this.renderNamespaceSelect('Namespace', 'namespace', 'resource')}
+                {this.renderNamespaceSelect(<Trans>formNamespace</Trans>, 'namespace', 'resource')}
               </FormControl>
             </Grid>
 
@@ -432,15 +438,17 @@ class TapQueryForm extends React.Component {
             </Grid>
 
             <Grid item>
-              { this.renderTapButton(tapRequestInProgress, tapIsClosing) }
-              <Button onClick={this.resetTapForm} disabled={tapRequestInProgress} className={classes.resetButton}>Reset</Button>
+              {this.renderTapButton(tapRequestInProgress, tapIsClosing)}
+              <Button onClick={this.resetTapForm} disabled={tapRequestInProgress} className={classes.resetButton}>
+                <Trans>buttonReset</Trans>
+              </Button>
             </Grid>
           </Grid>
         </CardContent>
 
         <QueryToCliCmd cmdName={cmdName} query={query} resource={query.resource} />
 
-        { !enableAdvancedForm ? null : this.renderAdvancedTapForm() }
+        {!enableAdvancedForm ? null : this.renderAdvancedTapForm()}
 
       </Card>
     );

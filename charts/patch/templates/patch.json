@@ -1,5 +1,12 @@
 {{ $prefix := .Values.pathPrefix -}}
 [
+  {{- if .Values.addRootMetadata }}
+  {
+    "op": "add",
+    "path": "{{$prefix}}/metadata",
+    "value": {}
+  },
+  {{- end }}
   {{- if .Values.addRootAnnotations }}
   {
     "op": "add",
@@ -28,7 +35,16 @@
     "value": "{{$value}}"
   },
   {{- end }}
-  {{- if .Values.global.proxyInit }}
+  {{- if or .Values.proxyInit .Values.proxy }}
+  {{- if .Values.addRootVolumes }}
+  {
+    "op": "add",
+    "path": "{{$prefix}}/spec/volumes",
+    "value": []
+  },
+  {{- end }}
+  {{- end}}
+  {{- if and .Values.proxyInit (not .Values.cniEnabled) }}
   {{- if .Values.addRootInitContainers }}
   {
     "op": "add",
@@ -38,12 +54,20 @@
   {{- end }}
   {
     "op": "add",
+    "path": "{{$prefix}}/spec/volumes/-",
+    "value": {
+      "emptyDir": {},
+      "name": "linkerd-proxy-init-xtables-lock"
+    }
+  },
+  {
+    "op": "add",
     "path": "{{$prefix}}/spec/initContainers/-",
     "value":
       {{- include "partials.proxy-init" . | fromYaml | toPrettyJson | nindent 6 }}
   },
   {{- end }}
-  {{- with .Values.debugContainer }}
+  {{- if .Values.debugContainer }}
   {
     "op": "add",
     "path": "{{$prefix}}/spec/containers/-",
@@ -51,15 +75,8 @@
       {{- include "partials.debug" . | fromYaml | toPrettyJson | nindent 6 }}
   },
   {{- end }}
-  {{- if .Values.global.proxy }}
-  {{- if .Values.addRootVolumes }}
-  {
-    "op": "add",
-    "path": "{{$prefix}}/spec/volumes",
-    "value": []
-  },
-  {{- end }}
-  {{- if not .Values.global.proxy.disableIdentity -}}
+  {{- if .Values.proxy }}
+  {{- if not .Values.proxy.disableIdentity -}}
   {
     "op": "add",
     "path": "{{$prefix}}/spec/volumes/-",
@@ -73,7 +90,11 @@
   {{- end }}
   {
     "op": "add",
+  {{- if .Values.proxy.await }}
+    "path": "{{$prefix}}/spec/containers/0",
+  {{- else }}
     "path": "{{$prefix}}/spec/containers/-",
+  {{- end }}
     "value":
       {{- include "partials.proxy" . | fromYaml | toPrettyJson | nindent 6 }}
   },

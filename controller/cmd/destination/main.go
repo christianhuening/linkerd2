@@ -1,6 +1,7 @@
 package destination
 
 import (
+	"context"
 	"flag"
 	"net"
 	"os"
@@ -10,10 +11,10 @@ import (
 	"github.com/linkerd/linkerd2/controller/api/destination"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	"github.com/linkerd/linkerd2/pkg/admin"
-	"github.com/linkerd/linkerd2/pkg/config"
 	"github.com/linkerd/linkerd2/pkg/flags"
-	consts "github.com/linkerd/linkerd2/pkg/k8s"
+	pkgK8s "github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/trace"
+	"github.com/linkerd/linkerd2/pkg/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -27,6 +28,10 @@ func Main(args []string) {
 	enableH2Upgrade := cmd.Bool("enable-h2-upgrade", true, "Enable transparently upgraded HTTP2 connections among pods in the service mesh")
 	disableIdentity := cmd.Bool("disable-identity", false, "Disable identity configuration")
 	controllerNamespace := cmd.String("controller-namespace", "linkerd", "namespace in which Linkerd is installed")
+	enableEndpointSlices := cmd.Bool("enable-endpoint-slices", false, "Enable the usage of EndpointSlice informers and resources")
+	trustDomain := cmd.String("identity-trust-domain", "", "configures the name suffix used for identities")
+	clusterDomain := cmd.String("cluster-domain", "", "kubernetes cluster domain")
+	defaultOpaquePorts := cmd.String("default-opaque-ports", "", "configures the default opaque ports")
 
 	traceCollector := flags.AddTraceFlags(cmd)
 
@@ -35,14 +40,6 @@ func Main(args []string) {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	k8sAPI, err := k8s.InitializeAPI(
-		*kubeConfigPath,
-		k8s.Endpoint, k8s.Pod, k8s.RS, k8s.Svc, k8s.SP, k8s.TS, k8s.Job,
-	)
-	if err != nil {
-		log.Fatalf("Failed to initialize K8s API: %s", err)
-	}
-
 	done := make(chan struct{})
 
 	lis, err := net.Listen("tcp", *addr)
@@ -50,24 +47,26 @@ func Main(args []string) {
 		log.Fatalf("Failed to listen on %s: %s", *addr, err)
 	}
 
-	global, err := config.Global(consts.MountPathGlobalConfig)
-
-	trustDomain := ""
 	if *disableIdentity {
 		log.Info("Identity is disabled")
 	} else {
-		trustDomain = global.GetIdentityContext().GetTrustDomain()
-		if err != nil || trustDomain == "" {
-			trustDomain = "cluster.local"
-			log.Warnf("failed to load trust domain from global config: [%s] (falling back to %s)", err, trustDomain)
+		if *trustDomain == "" {
+			*trustDomain = "cluster.local"
+			log.Warnf(" expected trust domain through args (falling back to %s)", *trustDomain)
 		}
 	}
 
-	clusterDomain := global.GetClusterDomain()
-	if err != nil || clusterDomain == "" {
-		clusterDomain = "cluster.local"
-		log.Warnf("failed to load cluster domain from global config: [%s] (falling back to %s)", err, clusterDomain)
+	if *clusterDomain == "" {
+		*clusterDomain = "cluster.local"
+		log.Warnf("expected cluster domain through args (falling back to %s)", *clusterDomain)
 	}
+
+	opaquePorts, err := util.ParsePorts(*defaultOpaquePorts)
+	if err != nil {
+		log.Fatalf("Failed to parse opaque Ports %s: %s", *defaultOpaquePorts, err)
+	}
+
+	log.Infof("Using default opaque ports: %v", opaquePorts)
 
 	if *traceCollector != "" {
 		if err := trace.InitializeTracing("linkerd-destination", *traceCollector); err != nil {
@@ -75,17 +74,57 @@ func Main(args []string) {
 		}
 	}
 
-	server := destination.NewServer(
+	// we need to create a separate client to check for EndpointSlice access in k8s cluster
+	// when slices are enabled and registered, k8sAPI is initialized with 'ES' resource
+	k8Client, err := pkgK8s.NewAPI(*kubeConfigPath, "", "", []string{}, 0)
+	if err != nil {
+		log.Fatalf("Failed to initialize K8s API Client: %s", err)
+	}
+
+	ctx := context.Background()
+
+	err = pkgK8s.EndpointSliceAccess(ctx, k8Client)
+	if *enableEndpointSlices && err != nil {
+		log.Fatalf("Failed to start with EndpointSlices enabled: %s", err)
+	}
+
+	var k8sAPI *k8s.API
+	if *enableEndpointSlices {
+		k8sAPI, err = k8s.InitializeAPI(
+			ctx,
+			*kubeConfigPath,
+			true,
+			k8s.Endpoint, k8s.ES, k8s.Pod, k8s.RS, k8s.Svc, k8s.SP, k8s.TS, k8s.Job, k8s.NS, k8s.Node,
+		)
+	} else {
+		k8sAPI, err = k8s.InitializeAPI(
+			ctx,
+			*kubeConfigPath,
+			true,
+			k8s.Endpoint, k8s.Pod, k8s.RS, k8s.Svc, k8s.SP, k8s.TS, k8s.Job, k8s.NS, k8s.Node,
+		)
+	}
+	if err != nil {
+		log.Fatalf("Failed to initialize K8s API: %s", err)
+	}
+
+	server, err := destination.NewServer(
 		*addr,
 		*controllerNamespace,
-		trustDomain,
+		*trustDomain,
 		*enableH2Upgrade,
+		*enableEndpointSlices,
 		k8sAPI,
-		clusterDomain,
+		*clusterDomain,
+		opaquePorts,
 		done,
 	)
 
-	k8sAPI.Sync() // blocks until caches are synced
+	if err != nil {
+		log.Fatalf("Failed to initialize destination server: %s", err)
+	}
+
+	k8sAPI.Sync(nil) // blocks until caches are synced
 
 	go func() {
 		log.Infof("starting gRPC server on %s", *addr)

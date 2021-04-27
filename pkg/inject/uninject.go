@@ -11,7 +11,7 @@ import (
 // Uninject removes from the workload in conf the init and proxy containers,
 // the TLS volumes and the extra annotations/labels that were added
 func (conf *ResourceConfig) Uninject(report *Report) ([]byte, error) {
-	if conf.IsNamespace() {
+	if conf.IsNamespace() || conf.IsService() {
 		uninjectObjectMeta(conf.workload.Meta, report)
 		return conf.YamlMarshalObj()
 	}
@@ -56,7 +56,7 @@ func (conf *ResourceConfig) uninjectPodSpec(report *Report) {
 
 	volumes := []v1.Volume{}
 	for _, volume := range t.Volumes {
-		if volume.Name != k8s.IdentityEndEntityVolumeName {
+		if volume.Name != k8s.IdentityEndEntityVolumeName && volume.Name != k8s.InitXtablesLockVolumeMountName {
 			volumes = append(volumes, volume)
 		}
 	}

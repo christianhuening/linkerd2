@@ -1,11 +1,14 @@
 package k8s
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"google.golang.org/grpc/codes"
@@ -40,7 +43,7 @@ func newAPI(retry bool, resourceConfigs []string, extraConfigs ...string) (*API,
 	}
 
 	if retry {
-		api.Sync()
+		api.Sync(nil)
 	}
 
 	return api, k8sResults, nil
@@ -265,7 +268,7 @@ metadata:
 				t.Fatalf("newAPI error: %s", err)
 			}
 
-			pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name)
+			pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name, labels.Everything())
 			if err != nil || exp.err != nil {
 				if (err == nil && exp.err != nil) ||
 					(err != nil && exp.err == nil) ||
@@ -327,7 +330,7 @@ status:
 					t.Fatalf("newAPI error: %s", err)
 				}
 
-				pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name)
+				pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name, labels.Everything())
 				if err != nil {
 					t.Fatalf("api.GetObjects() unexpected error %s", err)
 				}
@@ -384,7 +387,7 @@ status:
 					t.Fatalf("newAPI error: %s", err)
 				}
 
-				pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name)
+				pods, err := api.GetObjects(exp.namespace, exp.resType, exp.name, labels.Everything())
 				if err != nil {
 					t.Fatalf("api.GetObjects() unexpected error %s", err)
 				}
@@ -447,7 +450,7 @@ kind: Service
 metadata:
   name: emoji-svc
   namespace: emojivoto
-  uid: serviceUIDdoesntMatter
+  uid: serviceUIDDoesNotMatter
 spec:
   type: ClusterIP
   selector:
@@ -1071,7 +1074,7 @@ metadata:
 				}
 
 				pod := objs[0].(*corev1.Pod)
-				ownerKind, ownerName := api.GetOwnerKindAndName(pod, !retry)
+				ownerKind, ownerName := api.GetOwnerKindAndName(context.Background(), pod, !retry)
 
 				if ownerKind != tt.expectedOwnerKind {
 					t.Fatalf("Expected kind to be [%s], got [%s]", tt.expectedOwnerKind, ownerKind)
@@ -1143,7 +1146,7 @@ spec:
     name: client`,
 			},
 		},
-		// Service porfile in client namespace takes priority
+		// Service profile in client namespace takes priority
 		{
 			expectedRouteNames: []string{"client"},
 			profileConfigs: []string{`

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -eu
 
@@ -12,6 +12,7 @@ fi
 bindir=$( cd "${BASH_SOURCE[0]%/*}" && pwd )
 rootdir=$( cd "$bindir"/.. && pwd )
 
+# shellcheck source=_docker.sh
 . "$bindir"/_docker.sh
 
 workdir=$rootdir/target/release
@@ -22,8 +23,12 @@ shorttag=${tag#v}
 
 # create the cli-bin container in order to extract the binaries
 id=$(docker create "$(docker_repo cli-bin):$tag")
+OS="darwin windows linux-amd64 darwin-arm64"
+if [ -n "$DOCKER_MULTIARCH" ]; then
+    OS+=" linux-arm64 linux-arm"
+fi
 
-for os in darwin linux windows ; do
+for os in $OS; do
   ext=$os
   if [ "$os" = windows ]; then
     ext=windows.exe

@@ -1,0 +1,32 @@
+# -- If the gateway component should be installed
+gateway: true
+# -- The name of the gateway that will be installed
+gatewayName: linkerd-gateway
+# -- The port on which all the gateway will accept incoming traffic
+gatewayPort: 4143
+# -- The path that will be used by remote clusters for determining whether the
+# gateway is alive
+gatewayProbePath: /ready
+# -- The port used for liveliness probing
+gatewayProbePort: 4191
+# -- The interval (in seconds) between liveness probes
+gatewayProbeSeconds: 3
+# -- If the namespace should be installed
+installNamespace: true
+# -- Control plane version
+linkerdVersion: linkerdVersionValue
+# -- Service Mirror component namespace
+namespace: linkerd-multicluster
+# -- The port on which the proxy accepts outbound traffic
+proxyOutboundPort: 4140
+# -- If the remote mirror service account should be installed
+remoteMirrorServiceAccount: true
+# -- The name of the service account used to allow remote clusters to mirror
+# local services
+remoteMirrorServiceAccountName: linkerd-service-mirror-remote-access-default
+# -- Service Type of gateway Service
+gatewayServiceType: LoadBalancer
+# -- Namespace of linkerd installation
+linkerdNamespace: linkerd
+# -- Identity Trust Domain of the certificate authority
+identityTrustDomain: cluster.local
